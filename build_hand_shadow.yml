@@ -1,0 +1,783 @@
+name: Build SC Hand Gesture APK
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - main
+    - master
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+    - name: Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+    - name: Android SDK
+      uses: android-actions/setup-android@v3
+    - name: Install SDK
+      run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+    - name: Gradle
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: 8.10.2
+    - name: Generate project
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf generated-android
+        mkdir -p generated-android/app
+        cat > generated-android/app/build.gradle.kts <<'SC_FILE_EOF'
+        plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+        }
+
+        android {
+            namespace = "com.sc.millegesture"
+            compileSdk = 35
+
+            defaultConfig {
+                applicationId = "com.sc.millegesture"
+                minSdk = 26
+                targetSdk = 35
+                versionCode = 2
+                versionName = "2.0.0"
+            }
+
+            buildTypes {
+                release {
+                    isMinifyEnabled = false
+                    proguardFiles(
+                        getDefaultProguardFile("proguard-android-optimize.txt"),
+                        "proguard-rules.pro"
+                    )
+                }
+            }
+
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_17
+                targetCompatibility = JavaVersion.VERSION_17
+            }
+
+            kotlinOptions {
+                jvmTarget = "17"
+            }
+        }
+
+        dependencies {
+            testImplementation("junit:junit:4.13.2")
+            implementation("androidx.core:core-ktx:1.15.0")
+            implementation("androidx.appcompat:appcompat:1.7.0")
+            implementation("com.google.android.material:material:1.12.0")
+            implementation("androidx.lifecycle:lifecycle-service:2.8.7")
+
+            val camerax = "1.4.1"
+            implementation("androidx.camera:camera-core:$camerax")
+            implementation("androidx.camera:camera-camera2:$camerax")
+            implementation("androidx.camera:camera-lifecycle:$camerax")
+
+            implementation("com.google.mediapipe:tasks-vision:1.0.0")
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app
+        cat > generated-android/app/proguard-rules.pro <<'SC_FILE_EOF'
+        # No shrinking in v1.
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main
+        cat > generated-android/app/src/main/AndroidManifest.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+            <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
+
+            <uses-permission android:name="android.permission.CAMERA" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+            <uses-feature
+                android:name="android.hardware.camera.front"
+                android:required="true" />
+
+            <uses-feature android:name="android.hardware.camera" android:required="false" />
+            <application
+                android:allowBackup="false"
+                android:label="@string/app_name"
+                android:theme="@style/Theme.SCMilleGesture"
+                android:usesCleartextTraffic="false">
+
+                <activity
+                    android:name=".MainActivity"
+                    android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+
+                <service
+                    android:name=".GestureCameraService"
+                    android:exported="false"
+                    android:foregroundServiceType="camera" />
+
+                <service
+                    android:name=".GestureAccessibilityService"
+                    android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                    android:exported="false">
+                    <intent-filter>
+                        <action android:name="android.accessibilityservice.AccessibilityService" />
+                    </intent-filter>
+                    <meta-data
+                        android:name="android.accessibilityservice"
+                        android:resource="@xml/accessibility_service_config" />
+                </service>
+            </application>
+        </manifest>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/GestureAccessibilityService.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import android.accessibilityservice.AccessibilityService
+        import android.accessibilityservice.GestureDescription
+        import android.app.KeyguardManager
+        import android.content.Intent
+        import android.graphics.Path
+        import android.graphics.Rect
+        import android.os.Handler
+        import android.os.Looper
+        import android.view.accessibility.AccessibilityEvent
+        import android.view.accessibility.AccessibilityWindowInfo
+
+        class GestureAccessibilityService : AccessibilityService() {
+            companion object { @Volatile var instance: GestureAccessibilityService? = null; private set }
+            private var busy = false
+            private val handler = Handler(Looper.getMainLooper())
+            override fun onServiceConnected() { super.onServiceConnected(); instance = this }
+            override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+            override fun onInterrupt() { stopService(Intent(this, GestureCameraService::class.java)); HandOverlayManager.remove() }
+            override fun onDestroy() {
+                if (instance === this) instance = null
+                stopService(Intent(this, GestureCameraService::class.java))
+                HandOverlayManager.remove(); handler.removeCallbacksAndMessages(null); super.onDestroy()
+            }
+            fun perform(direction: Direction): Boolean {
+                if (busy || getSystemService(KeyguardManager::class.java).isKeyguardLocked) return false
+                // Resolve the current focused application window on every gesture, including split screen.
+                val win = windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isFocused }
+                    ?: windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isActive }
+                    ?: return false
+                val root = win.root ?: return false
+                val pkg = root.packageName?.toString()
+                @Suppress("DEPRECATION") root.recycle()
+                if (pkg == packageName) return false // Keep START/STOP and settings operable.
+                val b = Rect(); win.getBoundsInScreen(b)
+                if (b.width() < 100 || b.height() < 100) return false
+                val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+                val horizontal = direction == Direction.LEFT || direction == Direction.RIGHT
+                var positive = direction == Direction.RIGHT || direction == Direction.DOWN
+                if (prefs.getBoolean(if(horizontal) "reverseX" else "reverseY",false)) positive = !positive
+                val cx = b.exactCenterX(); val cy = b.exactCenterY()
+                val path = Path()
+                val tap = horizontal && !prefs.getBoolean("swipe",false)
+                if (tap) path.moveTo(b.left + b.width() * if(positive) .84f else .16f, cy)
+                else {
+                    val span = .2f + .55f * prefs.getInt("distance",50).coerceIn(0,100) / 100f
+                    val delta = (if(horizontal) b.width() else b.height()) * span / 2f * if(positive) 1f else -1f
+                    if(horizontal) { path.moveTo(cx-delta,cy); path.lineTo(cx+delta,cy) }
+                    else { path.moveTo(cx,cy-delta); path.lineTo(cx,cy+delta) }
+                }
+                val gesture = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path,0,if(tap) 60L else 420L)).build()
+                busy = true
+                val accepted = dispatchGesture(gesture,object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) { busy = false }
+                    override fun onCancelled(gestureDescription: GestureDescription?) { busy = false; RuntimeState.message = "동작 취소됨 · 다시 손을 접었다 펴세요" }
+                },handler)
+                if(!accepted) busy = false
+                return accepted
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/GestureCameraService.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import android.Manifest
+        import android.app.*
+        import android.content.*
+        import android.content.pm.PackageManager
+        import android.graphics.Bitmap
+        import android.graphics.Matrix
+        import android.hardware.display.DisplayManager
+        import android.os.*
+        import android.util.Size
+        import android.view.Surface
+        import androidx.camera.core.*
+        import androidx.camera.lifecycle.ProcessCameraProvider
+        import androidx.core.app.NotificationCompat
+        import androidx.core.content.ContextCompat
+        import androidx.lifecycle.LifecycleService
+        import com.google.mediapipe.framework.image.BitmapImageBuilder
+        import com.google.mediapipe.tasks.core.BaseOptions
+        import com.google.mediapipe.tasks.vision.core.RunningMode
+        import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
+        import java.util.concurrent.Executors
+
+        class GestureCameraService : LifecycleService() {
+            companion object { const val ACTION_STOP = "com.sc.millegesture.STOP" }
+            private val worker = Executors.newSingleThreadExecutor()
+            private val main = Handler(Looper.getMainLooper())
+            private var provider: ProcessCameraProvider? = null
+            private var analysis: ImageAnalysis? = null
+            private var recognizer: GestureRecognizer? = null // Owned solely by worker.
+            private val engine = GestureEngine() // Owned solely by main thread.
+            @Volatile private var alive = true
+            private var started = false
+            private var failed = false
+            private var lastSubmitted = 0L
+            private var startAt = 0L
+            private var lastRotation = -1
+            private var framesFailed = 0
+            private val screenOff = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) { stopSelf() }
+            }
+            private val watchdog = object : Runnable {
+                override fun run() {
+                    if (!alive || !started) return
+                    if (GestureAccessibilityService.instance == null) { fail("접근성 연결이 끊겼습니다"); return }
+                    val since = if(RuntimeState.lastFrame == 0L) startAt else RuntimeState.lastFrame
+                    if (SystemClock.uptimeMillis()-since > 15000) { fail("15초 동안 카메라 영상 없음 · 카메라를 쓰는 앱을 닫고 다시 START"); return }
+                    main.postDelayed(this,1000)
+                }
+            }
+            override fun onCreate() {
+                super.onCreate()
+                getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("gesture_camera","손 제스처",NotificationManager.IMPORTANCE_LOW))
+                ContextCompat.registerReceiver(this,screenOff,IntentFilter(Intent.ACTION_SCREEN_OFF),ContextCompat.RECEIVER_NOT_EXPORTED)
+            }
+            override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                super.onStartCommand(intent,flags,startId)
+                if(intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
+                try { startForeground(4101,notification()) } catch(e: Exception) { fail("카메라 서비스 시작 실패: ${e.message}"); return START_NOT_STICKY }
+                if(started) return START_NOT_STICKY
+                if(ContextCompat.checkSelfPermission(this,Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                    fail("카메라 권한이 필요합니다"); return START_NOT_STICKY
+                }
+                started = true; RuntimeState.running = true; RuntimeState.lastFrame = 0
+                RuntimeState.message = "모델·카메라 준비 중"; startAt = SystemClock.uptimeMillis()
+                main.post(watchdog)
+                worker.execute {
+                    try {
+                        val options = GestureRecognizer.GestureRecognizerOptions.builder()
+                            .setBaseOptions(BaseOptions.builder().setModelAssetPath("gesture_recognizer.task").build())
+                            .setRunningMode(RunningMode.VIDEO).setNumHands(1)
+                            .setMinHandDetectionConfidence(.55f).setMinHandPresenceConfidence(.55f).setMinTrackingConfidence(.55f).build()
+                        if(alive) recognizer = GestureRecognizer.createFromOptions(this,options)
+                        main.post { if(alive) startCamera() }
+                    } catch(e: Exception) { main.post { if(alive) fail("인식 모델 오류: ${e.message}") } }
+                }
+                return START_NOT_STICKY
+            }
+            private fun rotation(): Int = getSystemService(DisplayManager::class.java).getDisplay(android.view.Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0
+            private fun startCamera() {
+                val future = ProcessCameraProvider.getInstance(this)
+                future.addListener({
+                    if(!alive) return@addListener
+                    try {
+                        val cameraProvider = future.get(); provider = cameraProvider
+                        @Suppress("DEPRECATION")
+                        val useCase = ImageAnalysis.Builder().setTargetResolution(Size(640,480))
+                            .setTargetRotation(rotation()).setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888).build()
+                        analysis = useCase
+                        useCase.setAnalyzer(worker) { frame -> analyze(frame) }
+                        val camera = cameraProvider.bindToLifecycle(this,CameraSelector.DEFAULT_FRONT_CAMERA,useCase)
+                        camera.cameraInfo.cameraState.observe(this) { state ->
+                            if(state.error != null) RuntimeState.message = "카메라 상태 오류 ${state.error?.code} · 다른 카메라 앱을 닫으세요"
+                        }
+                    } catch(e: Exception) { fail("카메라 연결 실패: ${e.message}") }
+                },ContextCompat.getMainExecutor(this))
+            }
+            private fun analyze(frame: ImageProxy) {
+                var raw: Bitmap? = null; var transformed: Bitmap? = null
+                try {
+                    if(!alive) return
+                    val now = SystemClock.uptimeMillis()
+                    if(now-lastSubmitted < 80) return
+                    lastSubmitted = now
+                    RuntimeState.lastFrame = now
+                    val currentRotation = rotation()
+                    if(currentRotation != lastRotation) {
+                        lastRotation = currentRotation
+                        main.post { if(alive) { analysis?.targetRotation = currentRotation; engine.reset(); HandOverlayManager.update(null) } }
+                        return
+                    }
+                    // ImageProxy.toBitmap handles RGBA row stride and padding correctly.
+                    val bitmap = frame.toBitmap(); raw = bitmap
+                    val matrix = Matrix().apply { postRotate(frame.imageInfo.rotationDegrees.toFloat()); postScale(-1f,1f) }
+                    val rotated = Bitmap.createBitmap(bitmap,0,0,bitmap.width,bitmap.height,matrix,true); transformed = rotated
+                    val image = BitmapImageBuilder(rotated).build()
+                    val result = try { recognizer?.recognizeForVideo(image,now) } finally { image.close() }
+                    if(result == null) return
+                    val hand = result.landmarks().firstOrNull()
+                    val points = hand?.takeIf { it.size == 21 }?.map { it.x() to it.y() }
+                    val top = result.gestures().firstOrNull()?.firstOrNull()
+                    val open = top?.categoryName() == "Open_Palm" && top.score() >= .55f
+                    val fist = top?.categoryName() == "Closed_Fist" && top.score() >= .55f
+                    framesFailed = 0
+                    main.post {
+                        if(!alive || SystemClock.uptimeMillis()-now > 400) return@post
+                        HandOverlayManager.update(points)
+                        val ids = listOf(0,5,9,13,17)
+                        val x = if(points == null) 0f else ids.map { points[it].first }.average().toFloat()
+                        val y = if(points == null) 0f else ids.map { points[it].second }.average().toFloat()
+                        val sensitivity = getSharedPreferences("settings",MODE_PRIVATE).getInt("sensitivity",50).coerceIn(0,100)
+                        val direction = engine.sample(now,x,y,open,fist,points == null,.26f-.002f*sensitivity)
+                        if(direction != null) {
+                            val done = GestureAccessibilityService.instance?.perform(direction) == true
+                            RuntimeState.message = if(done) "동작 실행 · 손을 접었다 펴세요" else "동작 전달 실패 · 대상 앱으로 이동 후 다시 시도"
+                        } else RuntimeState.message = when {
+                            engine.awaitingRelease -> "다시 준비하려면 손을 접거나 카메라 밖으로 빼세요"
+                            points == null -> "영상 수신 중 · 손을 비춰주세요"
+                            open -> "준비됨 · 손바닥을 한 방향으로 움직이세요"
+                            else -> "손 인식 중 · 손바닥을 펴세요"
+                        }
+                    }
+                } catch(e: Exception) {
+                    framesFailed++
+                    main.post { if(alive) { HandOverlayManager.update(null); RuntimeState.message = "영상 분석 오류: ${e.message}" } }
+                    if(framesFailed >= 5) main.post { if(alive) fail("영상 분석이 반복 실패했습니다 · 다시 START") }
+                } finally {
+                    if(transformed !== raw) transformed?.recycle()
+                    raw?.recycle(); frame.close()
+                }
+            }
+            private fun fail(message: String) { failed = true; RuntimeState.message = message; stopSelf() }
+            private fun notification(): Notification {
+                val content = PendingIntent.getActivity(this,10,Intent(this,MainActivity::class.java),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                val stop = PendingIntent.getService(this,11,Intent(this,GestureCameraService::class.java).setAction(ACTION_STOP),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                return NotificationCompat.Builder(this,"gesture_camera").setSmallIcon(android.R.drawable.ic_menu_camera)
+                    .setContentTitle("SC Hand Gesture").setContentText("손 제스처 카메라 사용 중 · 중지 버튼으로 종료")
+                    .setContentIntent(content).setOngoing(true).addAction(0,"중지",stop).build()
+            }
+            override fun onDestroy() {
+                alive = false; RuntimeState.running = false; RuntimeState.lastFrame = 0
+                if(!failed) RuntimeState.message = "중지됨"
+                main.removeCallbacksAndMessages(null)
+                runCatching { unregisterReceiver(screenOff) }
+                analysis?.clearAnalyzer(); analysis?.let { provider?.unbind(it) }; analysis = null; provider = null
+                HandOverlayManager.remove()
+                // Close on the same serial worker after any in-flight recognition finishes.
+                worker.execute { runCatching { recognizer?.close() }; recognizer = null }
+                worker.shutdown()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                super.onDestroy()
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/GestureEngine.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import kotlin.math.abs
+
+        enum class Direction { LEFT, RIGHT, UP, DOWN }
+        /** A fired gesture stays latched until a deliberate fist or prolonged absence. */
+        class GestureEngine {
+            private var locked = false
+            val awaitingRelease: Boolean get() = locked
+            private var releaseSince: Long? = null
+            private var origin: Pair<Float, Float>? = null
+            private var originAt = 0L
+            private var previousAt = -1L
+            fun reset() { locked = false; releaseSince = null; origin = null; previousAt = -1L }
+            fun sample(t: Long, x: Float, y: Float, open: Boolean, fist: Boolean,
+                       absent: Boolean, threshold: Float = .16f): Direction? {
+                if (previousAt >= 0 && t - previousAt > 350) { origin = null; releaseSince = null }
+                previousAt = t
+                if (locked) {
+                    if (fist || absent) {
+                        val since = releaseSince ?: t.also { releaseSince = it }
+                        if (t - since >= if (fist) 350L else 700L) {
+                            locked = false; origin = null; releaseSince = null
+                        }
+                    } else releaseSince = null
+                    return null
+                }
+                if (!open) { origin = null; return null }
+                val o = origin
+                if (o == null) { origin = x to y; originAt = t; return null }
+                val dx = x - o.first; val dy = y - o.second
+                if (t - originAt > 850) { origin = x to y; originAt = t; return null }
+                if (t - originAt < 120) return null
+                val direction = when {
+                    abs(dx) >= threshold && abs(dx) > abs(dy) * 1.4f -> if (dx > 0) Direction.RIGHT else Direction.LEFT
+                    abs(dy) >= threshold && abs(dy) > abs(dx) * 1.4f -> if (dy > 0) Direction.DOWN else Direction.UP
+                    else -> null
+                }
+                if (direction != null) { locked = true; origin = null; releaseSince = null }
+                return direction
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/HandOverlay.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import android.content.Context
+        import android.graphics.*
+        import android.os.Handler
+        import android.os.Looper
+        import android.view.Gravity
+        import android.view.View
+        import android.view.WindowManager
+        import kotlin.math.hypot
+
+        object HandOverlayManager {
+            private var wm: WindowManager? = null
+            private var view: HandOverlayView? = null
+            private val handler = Handler(Looper.getMainLooper())
+            private val stale = Runnable { view?.update(null) }
+            fun update(points: List<Pair<Float,Float>>?) {
+                check(Looper.myLooper() == Looper.getMainLooper())
+                val service = GestureAccessibilityService.instance ?: return
+                if (!service.getSharedPreferences("settings",Context.MODE_PRIVATE).getBoolean("shadow",true)) { remove(); return }
+                if (view == null && points != null) {
+                    val manager = service.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                    val v = HandOverlayView(service)
+                    val params = WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.START }
+                    try { manager.addView(v,params); wm = manager; view = v }
+                    catch(e: Exception) { RuntimeState.message = "그림자 표시 실패: ${e.message}" }
+                }
+                view?.update(points)
+                handler.removeCallbacks(stale)
+                if(points != null) handler.postDelayed(stale,450)
+            }
+            fun remove() {
+                handler.removeCallbacks(stale)
+                view?.let { runCatching { wm?.removeView(it) } }; view = null; wm = null
+            }
+        }
+        class HandOverlayView(context: Context) : View(context) {
+            private var points: List<Pair<Float,Float>>? = null
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK; style = Paint.Style.FILL }
+            fun update(p: List<Pair<Float,Float>>?) {
+                val old = points
+                points = if(p != null && old != null && p.size == old.size) p.mapIndexed { i,v ->
+                    (old[i].first + (v.first-old[i].first)*.55f) to (old[i].second + (v.second-old[i].second)*.55f)
+                } else p
+                visibility = if(points == null) GONE else VISIBLE; invalidate()
+            }
+            override fun onDraw(canvas: Canvas) {
+                val p = points?.takeIf { it.size == 21 } ?: return
+                fun x(i:Int) = p[i].first * width
+                fun y(i:Int) = p[i].second * height
+                val palm = Path().apply {
+                    moveTo(x(0),y(0)); for(i in listOf(1,2,5,9,13,17)) lineTo(x(i),y(i)); close()
+                }
+                // Compose an opaque silhouette first: overlapping fingers share the same final alpha.
+                val layer = canvas.saveLayerAlpha(0f,0f,width.toFloat(),height.toFloat(),110)
+                canvas.drawPath(palm,paint)
+                val base = hypot(x(5)-x(17),y(5)-y(17)).coerceAtLeast(12f) * .115f
+                for(chain in arrayOf(intArrayOf(1,2,3,4),intArrayOf(5,6,7,8),intArrayOf(9,10,11,12),intArrayOf(13,14,15,16),intArrayOf(17,18,19,20))) {
+                    for(j in 0..2) {
+                        val a=chain[j]; val b=chain[j+1]
+                        val ra=base*(1f-j*.15f); val rb=base*(.85f-j*.15f)
+                        val dx=x(b)-x(a); val dy=y(b)-y(a); val len=hypot(dx,dy).coerceAtLeast(1f)
+                        val nx=-dy/len; val ny=dx/len
+                        val finger=Path().apply {
+                            moveTo(x(a)+nx*ra,y(a)+ny*ra); lineTo(x(b)+nx*rb,y(b)+ny*rb)
+                            lineTo(x(b)-nx*rb,y(b)-ny*rb); lineTo(x(a)-nx*ra,y(a)-ny*ra); close()
+                        }
+                        canvas.drawPath(finger,paint); canvas.drawCircle(x(a),y(a),ra,paint); canvas.drawCircle(x(b),y(b),rb,paint)
+                    }
+                }
+                canvas.restoreToCount(layer)
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/MainActivity.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import android.Manifest
+        import android.content.Intent
+        import android.content.pm.PackageManager
+        import android.graphics.Color
+        import android.os.Bundle
+        import android.os.Build
+        import android.os.Handler
+        import android.os.Looper
+        import android.os.SystemClock
+        import android.provider.Settings
+        import android.view.Gravity
+        import android.widget.*
+        import androidx.activity.result.contract.ActivityResultContracts
+        import androidx.appcompat.app.AppCompatActivity
+        import androidx.core.content.ContextCompat
+        import androidx.core.view.ViewCompat
+        import androidx.core.view.WindowInsetsCompat
+
+        class MainActivity : AppCompatActivity() {
+            private lateinit var status: TextView
+            private val handler = Handler(Looper.getMainLooper())
+            private val permission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { updateStatus() }
+            private val refresh = object : Runnable {
+                override fun run() { updateStatus(); handler.postDelayed(this, 600) }
+            }
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+                val root = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+                    setPadding(32, 32, 32, 32); setBackgroundColor(Color.rgb(17,17,17))
+                }
+                fun label(s: String, size: Float = 16f) = TextView(this).apply {
+                    text = s; textSize = size; setTextColor(Color.WHITE); setPadding(0,18,0,18)
+                    root.addView(this)
+                }
+                label("SC Hand Gesture", 28f)
+                label("by sc\n\n카메라 앞에서 손바닥을 펴고 움직이세요.\n→ 다음 페이지 · ← 이전 페이지\n↑ 아래 내용 보기 · ↓ 위 내용 보기\n\n한 번 동작한 뒤 손을 0.4초 접거나, 카메라 밖으로 0.8초 뺐다가 다시 펴세요.\nSTART 후 원하는 앱을 직접 여세요.")
+                status = label("")
+                fun button(s: String, block: () -> Unit) { root.addView(Button(this).apply {
+                    text = s; setOnClickListener { block() }
+                }) }
+                button("1. 카메라·알림 권한") {
+                    permission.launch(if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.CAMERA, Manifest.permission.POST_NOTIFICATIONS) else arrayOf(Manifest.permission.CAMERA))
+                }
+                button("2. 접근성 서비스 켜기") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                button("START") {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                        permission.launch(arrayOf(Manifest.permission.CAMERA))
+                    } else if (GestureAccessibilityService.instance == null) {
+                        Toast.makeText(this,"접근성 서비스를 먼저 켜주세요.",Toast.LENGTH_LONG).show()
+                        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    } else {
+                        runCatching { ContextCompat.startForegroundService(this, Intent(this, GestureCameraService::class.java)) }
+                            .onFailure { RuntimeState.message = "시작 실패: ${it.message}" }
+                    }
+                    updateStatus()
+                }
+                button("STOP") { stopService(Intent(this, GestureCameraService::class.java)); updateStatus() }
+                fun toggle(key: String, s: String, default: Boolean = false) {
+                    root.addView(Switch(this).apply {
+                        text = s; setTextColor(Color.WHITE); isChecked = prefs.getBoolean(key, default)
+                        setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(key, checked).apply() }
+                    })
+                }
+                toggle("swipe", "좌우: 탭 대신 스와이프")
+                toggle("reverseX", "좌우 방향 반전")
+                toggle("reverseY", "상하 방향 반전")
+                toggle("shadow", "손 그림자 표시", true)
+                fun slider(key: String, title: String, default: Int) {
+                    val text = label("$title: ${prefs.getInt(key, default)}")
+                    root.addView(SeekBar(this).apply {
+                        max = 100; progress = prefs.getInt(key, default)
+                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(v: SeekBar?, n: Int, fromUser: Boolean) {
+                                text.text = "$title: $n"; prefs.edit().putInt(key,n).apply()
+                            }
+                            override fun onStartTrackingTouch(v: SeekBar?) = Unit
+                            override fun onStopTrackingTouch(v: SeekBar?) = Unit
+                        })
+                    })
+                }
+                slider("sensitivity", "민감도 (높을수록 작은 움직임)", 50)
+                slider("distance", "스크롤 거리", 50)
+                label("화면 잠금 시 인식을 중지합니다.\n접근성은 손동작에 따른 탭·스와이프에 사용됩니다. 영상은 기기에서 처리하며 저장·전송하지 않습니다.")
+                val scroll = ScrollView(this).apply { addView(root) }
+                setContentView(scroll)
+                ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->
+                    val b = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+                    v.setPadding(b.left,b.top,b.right,b.bottom); insets
+                }
+            }
+            override fun onResume() { super.onResume(); handler.post(refresh) }
+            override fun onPause() { handler.removeCallbacks(refresh); super.onPause() }
+            private fun updateStatus() {
+                if (!::status.isInitialized) return
+                val camera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                val receiving = RuntimeState.running && SystemClock.uptimeMillis() - RuntimeState.lastFrame < 2000
+                status.text = "카메라 권한: ${if(camera) "허용" else "필요"}\n접근성 연결: ${if(GestureAccessibilityService.instance != null) "연결됨" else "필요"}\n실제 영상 수신: ${if(receiving) "수신 중" else "없음"}\n${RuntimeState.message}"
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/RuntimeState.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        object RuntimeState {
+            @Volatile var running = false
+            @Volatile var message = "중지됨"
+            @Volatile var lastFrame = 0L
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/drawable
+        cat > generated-android/app/src/main/res/drawable/ic_launcher_foreground.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <vector xmlns:android="http://schemas.android.com/apk/res/android"
+            android:width="108dp"
+            android:height="108dp"
+            android:viewportWidth="108"
+            android:viewportHeight="108">
+            <path
+                android:fillColor="#D92525"
+                android:pathData="M15,15h78v78h-78z"/>
+            <path
+                android:fillColor="#FFFFFF"
+                android:pathData="M29,51h33l-10,-10l7,-7l22,20l-22,20l-7,-7l10,-10h-33z"/>
+        </vector>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/values
+        cat > generated-android/app/src/main/res/values/colors.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <resources>
+            <color name="black">#111111</color>
+            <color name="white">#FFFFFF</color>
+            <color name="red">#D92525</color>
+            <color name="gray">#707070</color>
+        </resources>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/values
+        cat > generated-android/app/src/main/res/values/strings.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <resources>
+            <string name="app_name">SC Hand Gesture</string>
+            <string name="accessibility_description">사용자가 시작한 손 제스처에 따라 현재 앱을 탭하거나 스크롤합니다. 화면 내용과 카메라 영상은 저장하거나 전송하지 않습니다.</string>
+        </resources>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/values
+        cat > generated-android/app/src/main/res/values/themes.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <resources>
+            <style name="Theme.SCMilleGesture" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+                <item name="colorPrimary">@color/red</item>
+                <item name="colorPrimaryVariant">@color/red</item>
+                <item name="colorOnPrimary">@color/white</item>
+                <item name="android:fontFamily">sans</item>
+                <item name="android:windowLightStatusBar">false</item>
+            </style>
+        </resources>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/xml
+        cat > generated-android/app/src/main/res/xml/accessibility_service_config.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <accessibility-service
+            xmlns:android="http://schemas.android.com/apk/res/android"
+            android:description="@string/accessibility_description"
+            android:accessibilityEventTypes="typeWindowStateChanged"
+            android:accessibilityFeedbackType="feedbackGeneric"
+            android:notificationTimeout="100"
+            android:canRetrieveWindowContent="true"
+            android:canPerformGestures="true"
+            android:accessibilityFlags="flagRetrieveInteractiveWindows" />
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/test/java/com/sc/millegesture
+        cat > generated-android/app/src/test/java/com/sc/millegesture/GestureEngineTest.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import org.junit.Assert.*
+        import org.junit.Test
+        class GestureEngineTest {
+            private fun fire(e: GestureEngine, dx:Float, dy:Float, t:Long=0):Direction? {
+                e.sample(t,.5f,.5f,true,false,false)
+                return e.sample(t+200,.5f+dx,.5f+dy,true,false,false)
+            }
+            @Test fun fourDirections() {
+                assertEquals(Direction.RIGHT,fire(GestureEngine(),.2f,0f))
+                assertEquals(Direction.LEFT,fire(GestureEngine(),-.2f,0f))
+                assertEquals(Direction.UP,fire(GestureEngine(),0f,-.2f))
+                assertEquals(Direction.DOWN,fire(GestureEngine(),0f,.2f))
+            }
+            @Test fun returnDoesNotFireEvenAfterCooldown() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                for(t in 300L..3000L step 100) assertNull(e.sample(t,.3f,.5f,true,false,false))
+            }
+            @Test fun briefDropoutDoesNotUnlock() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                e.sample(300,0f,0f,false,false,true)
+                assertNull(e.sample(400,.7f,.5f,true,false,false))
+                assertNull(e.sample(600,.3f,.5f,true,false,false))
+            }
+            @Test fun heldFistUnlocks() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                for(t in 300L..700L step 100) e.sample(t,.5f,.5f,false,true,false)
+                assertEquals(Direction.LEFT,fire(e,-.2f,0f,800))
+            }
+            @Test fun absentHandUnlocksAfterDelay() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                for(t in 300L..1100L step 100) e.sample(t,0f,0f,false,false,true)
+                assertEquals(Direction.UP,fire(e,0f,-.2f,1200))
+            }
+            @Test fun slowMoveAndJitterDoNotFire() {
+                val e=GestureEngine()
+                for(t in 0L..2000L step 100) assertNull(e.sample(t,.5f+t*.00003f,.5f,true,false,false))
+            }
+            @Test fun diagonalIsIgnored() { assertNull(fire(GestureEngine(),.2f,.2f)) }
+            @Test fun stalledStreamDoesNotRearm() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                e.sample(300,0f,0f,false,false,true)
+                e.sample(2000,0f,0f,false,false,true)
+                assertNull(fire(e,-.2f,0f,2100))
+            }
+            @Test fun heldPalmCanMoveLater() {
+                val e=GestureEngine()
+                for(t in 0L..3000L step 100) e.sample(t,.5f,.5f,true,false,false)
+                assertEquals(Direction.RIGHT,e.sample(3200,.72f,.5f,true,false,false))
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/.
+        cat > generated-android/build.gradle.kts <<'SC_FILE_EOF'
+        plugins {
+            id("com.android.application") version "8.7.3" apply false
+            id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/.
+        cat > generated-android/gradle.properties <<'SC_FILE_EOF'
+        org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+        android.useAndroidX=true
+        kotlin.code.style=official
+        SC_FILE_EOF
+        mkdir -p generated-android/.
+        cat > generated-android/settings.gradle.kts <<'SC_FILE_EOF'
+        pluginManagement {
+            repositories {
+                google()
+                mavenCentral()
+                gradlePluginPortal()
+            }
+        }
+
+        dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories {
+                google()
+                mavenCentral()
+            }
+        }
+
+        rootProject.name = "SCMilleGesture"
+        include(":app")
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/assets
+        curl -fL --retry 3 "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task" -o generated-android/app/src/main/assets/gesture_recognizer.task
+    - name: Tests, APK and lint
+      working-directory: generated-android
+      run: gradle --no-daemon --max-workers=2 :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: SC-Hand-Gesture-v2-APK
+        path: generated-android/app/build/outputs/apk/debug/app-debug.apk
+        if-no-files-found: error
+        retention-days: 30
+    - name: Upload verification reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: SC-Hand-Gesture-reports
+        path: generated-android/app/build/reports/
+        if-no-files-found: ignore
