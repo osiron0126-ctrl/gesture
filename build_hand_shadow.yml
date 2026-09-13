@@ -1,0 +1,1693 @@
+name: Build SC Hand Gesture APK
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - main
+    - master
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+    - name: Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+    - name: Android SDK
+      uses: android-actions/setup-android@v3
+    - name: Install SDK
+      run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+    - name: Gradle
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: 8.10.2
+    - name: Generate project
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf generated-android
+        mkdir -p generated-android/app
+        cat > generated-android/app/build.gradle.kts <<'SC_FILE_EOF'
+        plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+        }
+
+        android {
+            namespace = "com.sc.millegesture"
+            compileSdk = 35
+
+            defaultConfig {
+                applicationId = "com.sc.millegesture"
+                minSdk = 26
+                targetSdk = 35
+                versionCode = 4
+                versionName = "4.0.0"
+            }
+
+            buildTypes {
+                release {
+                    isMinifyEnabled = false
+                    proguardFiles(
+                        getDefaultProguardFile("proguard-android-optimize.txt"),
+                        "proguard-rules.pro"
+                    )
+                }
+            }
+
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_17
+                targetCompatibility = JavaVersion.VERSION_17
+            }
+
+            kotlinOptions {
+                jvmTarget = "17"
+            }
+        }
+
+        dependencies {
+            testImplementation("junit:junit:4.13.2")
+            implementation("androidx.core:core-ktx:1.15.0")
+            implementation("androidx.appcompat:appcompat:1.7.0")
+            implementation("com.google.android.material:material:1.12.0")
+            implementation("androidx.lifecycle:lifecycle-service:2.8.7")
+
+            val camerax = "1.4.1"
+            implementation("androidx.camera:camera-core:$camerax")
+            implementation("androidx.camera:camera-camera2:$camerax")
+            implementation("androidx.camera:camera-lifecycle:$camerax")
+
+            implementation("com.google.mediapipe:tasks-vision:1.0.0")
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app
+        cat > generated-android/app/proguard-rules.pro <<'SC_FILE_EOF'
+        # No shrinking in v1.
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main
+        cat > generated-android/app/src/main/AndroidManifest.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+            <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
+
+            <uses-permission android:name="android.permission.CAMERA" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+            <uses-feature
+                android:name="android.hardware.camera.front"
+                android:required="true" />
+
+            <uses-feature android:name="android.hardware.camera" android:required="false" />
+            <application
+                android:allowBackup="false"
+                android:label="@string/app_name"
+                android:theme="@style/Theme.SCMilleGesture"
+                android:usesCleartextTraffic="false">
+
+                <activity
+                    android:name=".MainActivity"
+                    android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+
+                <service
+                    android:name=".GestureCameraService"
+                    android:exported="false"
+                    android:foregroundServiceType="camera" />
+
+                <service
+                    android:name=".GestureAccessibilityService"
+                    android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                    android:exported="false">
+                    <intent-filter>
+                        <action android:name="android.accessibilityservice.AccessibilityService" />
+                    </intent-filter>
+                    <meta-data
+                        android:name="android.accessibilityservice"
+                        android:resource="@xml/accessibility_service_config" />
+                </service>
+            </application>
+        </manifest>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/GestureAccessibilityService.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import android.accessibilityservice.AccessibilityService
+        import android.accessibilityservice.GestureDescription
+        import android.app.KeyguardManager
+        import android.content.Intent
+        import android.graphics.Path
+        import android.graphics.Rect
+        import android.os.Handler
+        import android.os.Looper
+        import android.view.accessibility.AccessibilityEvent
+        import android.view.accessibility.AccessibilityWindowInfo
+
+        class GestureAccessibilityService : AccessibilityService() {
+            companion object { @Volatile var instance: GestureAccessibilityService? = null; private set }
+            private var busy = false
+            private val handler = Handler(Looper.getMainLooper())
+            override fun onServiceConnected() { super.onServiceConnected(); instance = this }
+            override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+            override fun onInterrupt() { stopService(Intent(this, GestureCameraService::class.java)); HandOverlayManager.remove() }
+            override fun onDestroy() {
+                if (instance === this) instance = null
+                stopService(Intent(this, GestureCameraService::class.java))
+                HandOverlayManager.remove(); handler.removeCallbacksAndMessages(null); super.onDestroy()
+            }
+            private fun focusedApplication(): Pair<AccessibilityWindowInfo, Rect>? {
+                val win = windows.firstOrNull {
+                    it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isFocused
+                } ?: windows.firstOrNull {
+                    it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isActive
+                } ?: return null
+                val root = win.root ?: return null
+                val pkg = root.packageName?.toString()
+                @Suppress("DEPRECATION") root.recycle()
+                if (pkg == packageName) return null
+                val bounds = Rect()
+                win.getBoundsInScreen(bounds)
+                if (bounds.width() < 100 || bounds.height() < 100) return null
+                return win to bounds
+            }
+
+            fun tapAt(normalizedX: Float, normalizedY: Float): Boolean {
+                if (busy || getSystemService(KeyguardManager::class.java).isKeyguardLocked) return false
+                val (_, bounds) = focusedApplication() ?: return false
+                val x = (bounds.left + normalizedX.coerceIn(0.02f, 0.98f) * bounds.width())
+                    .coerceIn(bounds.left.toFloat(), bounds.right.toFloat() - 1f)
+                val y = (bounds.top + normalizedY.coerceIn(0.02f, 0.98f) * bounds.height())
+                    .coerceIn(bounds.top.toFloat(), bounds.bottom.toFloat() - 1f)
+                return dispatchTap(x, y)
+            }
+
+            /** Sends the conventional left/right edge tap used by page-based apps. */
+            fun pageTurn(next: Boolean): Boolean {
+                if (busy || getSystemService(KeyguardManager::class.java).isKeyguardLocked) return false
+                val (_, bounds) = focusedApplication() ?: return false
+                val normalizedX = if (next) .84f else .16f
+                val x = bounds.left + normalizedX * bounds.width()
+                val y = bounds.top + .52f * bounds.height()
+                return dispatchTap(x, y)
+            }
+
+            private fun dispatchTap(x: Float, y: Float): Boolean {
+                val path = Path().apply { moveTo(x, y) }
+                val gesture = GestureDescription.Builder()
+                    .addStroke(GestureDescription.StrokeDescription(path, 0, 65L))
+                    .build()
+                busy = true
+                val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) { busy = false }
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        busy = false
+                        RuntimeState.message = "터치 취소됨 · 다시 시도하세요"
+                    }
+                }, handler)
+                if (!accepted) busy = false
+                return accepted
+            }
+
+            fun performScroll(direction: Direction): Boolean {
+                if (busy || getSystemService(KeyguardManager::class.java).isKeyguardLocked) return false
+                val (_, b) = focusedApplication() ?: return false
+                if (b.width() < 100 || b.height() < 100) return false
+                val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+                var down = direction == Direction.DOWN
+                if (prefs.getBoolean("reverseY", false)) down = !down
+                val cx = b.exactCenterX()
+                val cy = b.exactCenterY()
+                val path = Path()
+                val span = .22f + .48f * prefs.getInt("distance", 50).coerceIn(0, 100) / 100f
+                val delta = b.height() * span / 2f
+                // Match the physical hand direction: hand up -> finger swipe up;
+                // hand down -> finger swipe down. The old code sent both directions
+                // from top to bottom, which made upward scrolling impossible.
+                if (down) {
+                    path.moveTo(cx, cy - delta)
+                    path.lineTo(cx, cy + delta)
+                } else {
+                    path.moveTo(cx, cy + delta)
+                    path.lineTo(cx, cy - delta)
+                }
+                val gesture = GestureDescription.Builder()
+                    .addStroke(GestureDescription.StrokeDescription(path, 0, 430L))
+                    .build()
+                busy = true
+                val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) { busy = false }
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        busy = false
+                        RuntimeState.message = "스크롤 취소됨 · 다시 시도하세요"
+                    }
+                }, handler)
+                if(!accepted) busy = false
+                return accepted
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/GestureCameraService.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+
+        import android.Manifest
+        import android.app.Notification
+        import android.app.NotificationChannel
+        import android.app.NotificationManager
+        import android.app.PendingIntent
+        import android.content.BroadcastReceiver
+        import android.content.Context
+        import android.content.Intent
+        import android.content.IntentFilter
+        import android.content.pm.PackageManager
+        import android.graphics.Bitmap
+        import android.graphics.Matrix
+        import android.hardware.display.DisplayManager
+        import android.os.Handler
+        import android.os.Looper
+        import android.os.SystemClock
+        import android.util.Size
+        import android.view.Surface
+        import androidx.camera.core.CameraSelector
+        import androidx.camera.core.ImageAnalysis
+        import androidx.camera.core.ImageProxy
+        import androidx.camera.lifecycle.ProcessCameraProvider
+        import androidx.core.app.NotificationCompat
+        import androidx.core.content.ContextCompat
+        import androidx.lifecycle.LifecycleService
+        import com.google.mediapipe.framework.image.BitmapImageBuilder
+        import com.google.mediapipe.tasks.components.containers.Category
+        import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+        import com.google.mediapipe.tasks.core.BaseOptions
+        import com.google.mediapipe.tasks.vision.core.RunningMode
+        import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
+        import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizerResult
+        import java.util.Locale
+        import java.util.concurrent.Executors
+
+        class GestureCameraService : LifecycleService() {
+            companion object {
+                const val ACTION_STOP = "com.sc.millegesture.STOP"
+                private const val CHANNEL_ID = "gesture_camera"
+                private const val NOTIFICATION_ID = 4101
+            }
+
+            private val worker = Executors.newSingleThreadExecutor()
+            private val main = Handler(Looper.getMainLooper())
+            private var provider: ProcessCameraProvider? = null
+            private var analysis: ImageAnalysis? = null
+            private var recognizer: GestureRecognizer? = null // Created and closed on worker.
+            private val twoFingerEngine = TwoFingerGestureEngine() // Used only on main.
+            private val tapTrigger = TapTrigger() // Used only on main.
+            @Volatile private var alive = true
+            private var started = false
+            private var failed = false
+            private var lastSubmitted = 0L
+            private var startAt = 0L
+            private var lastRotation = -1
+            private var framesFailed = 0
+
+            private val screenOff = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) { stopSelf() }
+            }
+
+            private val watchdog = object : Runnable {
+                override fun run() {
+                    if (!alive || !started) return
+                    if (GestureAccessibilityService.instance == null) {
+                        fail("접근성 연결이 끊겼습니다")
+                        return
+                    }
+                    val since = if (RuntimeState.lastFrame == 0L) startAt else RuntimeState.lastFrame
+                    if (SystemClock.uptimeMillis() - since > 15000L) {
+                        fail("15초 동안 카메라 영상 없음 · 카메라를 쓰는 앱을 닫고 다시 START")
+                        return
+                    }
+                    main.postDelayed(this, 1000L)
+                }
+            }
+
+            override fun onCreate() {
+                super.onCreate()
+                getSystemService(NotificationManager::class.java).createNotificationChannel(
+                    NotificationChannel(CHANNEL_ID, "손 제스처", NotificationManager.IMPORTANCE_LOW)
+                )
+                ContextCompat.registerReceiver(
+                    this,
+                    screenOff,
+                    IntentFilter(Intent.ACTION_SCREEN_OFF),
+                    ContextCompat.RECEIVER_NOT_EXPORTED
+                )
+            }
+
+            override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                // LifecycleService must receive the parent start callback before work begins.
+                super.onStartCommand(intent, flags, startId)
+                if (intent?.action == ACTION_STOP) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                try {
+                    startForeground(NOTIFICATION_ID, notification())
+                } catch (e: Exception) {
+                    fail("카메라 서비스 시작 실패: ${e.message}")
+                    return START_NOT_STICKY
+                }
+                if (started) return START_NOT_STICKY
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    fail("카메라 권한이 필요합니다")
+                    return START_NOT_STICKY
+                }
+
+                started = true
+                RuntimeState.running = true
+                RuntimeState.lastFrame = 0L
+                RuntimeState.message = "모델·카메라 준비 중"
+                startAt = SystemClock.uptimeMillis()
+                twoFingerEngine.reset()
+                tapTrigger.reset()
+                main.post(watchdog)
+
+                worker.execute {
+                    try {
+                        val options = GestureRecognizer.GestureRecognizerOptions.builder()
+                            .setBaseOptions(
+                                BaseOptions.builder()
+                                    .setModelAssetPath("gesture_recognizer.task")
+                                    .build()
+                            )
+                            .setRunningMode(RunningMode.VIDEO)
+                            .setNumHands(2)
+                            // The landmark geometry and one-shot timing filters below
+                            // reject noise, so a slightly lower model threshold keeps
+                            // a real pair of touching fingers from flickering out.
+                            .setMinHandDetectionConfidence(.45f)
+                            .setMinHandPresenceConfidence(.45f)
+                            .setMinTrackingConfidence(.45f)
+                            .build()
+                        if (alive) recognizer = GestureRecognizer.createFromOptions(this, options)
+                        main.post { if (alive) startCamera() }
+                    } catch (e: Exception) {
+                        main.post { if (alive) fail("인식 모델 오류: ${e.message}") }
+                    }
+                }
+                return START_NOT_STICKY
+            }
+
+            private fun rotation(): Int = getSystemService(DisplayManager::class.java)
+                .getDisplay(android.view.Display.DEFAULT_DISPLAY)?.rotation ?: Surface.ROTATION_0
+
+            private fun startCamera() {
+                val future = ProcessCameraProvider.getInstance(this)
+                future.addListener({
+                    if (!alive) return@addListener
+                    try {
+                        val cameraProvider = future.get()
+                        provider = cameraProvider
+                        @Suppress("DEPRECATION")
+                        val useCase = ImageAnalysis.Builder()
+                            .setTargetResolution(Size(640, 480))
+                            .setTargetRotation(rotation())
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                            .build()
+                        analysis = useCase
+                        useCase.setAnalyzer(worker) { frame -> analyze(frame) }
+                        val camera = cameraProvider.bindToLifecycle(
+                            this,
+                            CameraSelector.DEFAULT_FRONT_CAMERA,
+                            useCase
+                        )
+                        camera.cameraInfo.cameraState.observe(this) { state ->
+                            if (state.error != null) {
+                                RuntimeState.message =
+                                    "카메라 상태 오류 ${state.error?.code} · 다른 카메라 앱을 닫으세요"
+                            }
+                        }
+                    } catch (e: Exception) {
+                        fail("카메라 연결 실패: ${e.message}")
+                    }
+                }, ContextCompat.getMainExecutor(this))
+            }
+
+            private fun analyze(frame: ImageProxy) {
+                var raw: Bitmap? = null
+                var transformed: Bitmap? = null
+                try {
+                    if (!alive) return
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastSubmitted < 80L) return
+                    lastSubmitted = now
+                    RuntimeState.lastFrame = now
+
+                    val currentRotation = rotation()
+                    if (currentRotation != lastRotation) {
+                        lastRotation = currentRotation
+                        main.post {
+                            if (alive) {
+                                analysis?.targetRotation = currentRotation
+                                twoFingerEngine.reset()
+                                tapTrigger.reset()
+                                HandOverlayManager.update(emptyList())
+                            }
+                        }
+                        return
+                    }
+
+                    // ImageProxy.toBitmap handles RGBA row stride and padding correctly.
+                    val bitmap = frame.toBitmap()
+                    raw = bitmap
+                    val matrix = Matrix().apply {
+                        postRotate(frame.imageInfo.rotationDegrees.toFloat())
+                        postScale(-1f, 1f)
+                    }
+                    val rotated = Bitmap.createBitmap(
+                        bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+                    )
+                    transformed = rotated
+                    val image = BitmapImageBuilder(rotated).build()
+                    val result = try {
+                        recognizer?.recognizeForVideo(image, now)
+                    } finally {
+                        image.close()
+                    }
+                    if (result == null) return
+
+                    val hands = classifyHands(result)
+                    val right = hands.firstOrNull { it.isRight }
+                    val left = hands.firstOrNull { it.isLeft }
+                    val shadows = hands.filter { it.points.size == 21 }
+                    val leftFist = left?.closedFist == true
+                    val rightIndex = right?.indexTip
+                    val fingersTogether = right?.indexMiddleTogether == true
+                    val gesturePoint = right?.indexMiddleCenter
+                    framesFailed = 0
+
+                    main.post {
+                        if (!alive || SystemClock.uptimeMillis() - now > 450L) return@post
+                        HandOverlayManager.update(shadows)
+
+                        // The left hand is a momentary modifier. While it is a fist,
+                        // scrolling is paused so the tap cannot collide with a swipe.
+                        val tap = tapTrigger.sample(now, leftFist, rightIndex)
+                        if (tap != null) {
+                            twoFingerEngine.reset()
+                            val done = GestureAccessibilityService.instance?.tapAt(tap.first, tap.second) == true
+                            RuntimeState.message = if (done) {
+                                "오른손 검지 위치 터치 · 왼손을 펴면 다시 준비"
+                            } else {
+                                "터치 전달 실패 · 대상 앱을 확인하세요"
+                            }
+                            return@post
+                        }
+
+                        if (leftFist) {
+                            twoFingerEngine.reset()
+                            RuntimeState.message = if (rightIndex == null) {
+                                "왼손 주먹 감지 · 오른손 검지를 비춰주세요"
+                            } else {
+                                "터치 대기 · 왼손 주먹을 풀면 다시 준비"
+                            }
+                            return@post
+                        }
+
+                        val sensitivity = getSharedPreferences("settings", MODE_PRIVATE)
+                            .getInt("sensitivity", 50).coerceIn(0, 100)
+                        val threshold = .22f - .0015f * sensitivity
+                        val direction = twoFingerEngine.sample(
+                            now,
+                            gesturePoint,
+                            fingersTogether,
+                            threshold
+                        )
+                        if (direction != null) {
+                            val done = when (direction) {
+                                Direction.LEFT -> GestureAccessibilityService.instance?.pageTurn(next = false) == true
+                                Direction.RIGHT -> GestureAccessibilityService.instance?.pageTurn(next = true) == true
+                                Direction.UP, Direction.DOWN ->
+                                    GestureAccessibilityService.instance?.performScroll(direction) == true
+                            }
+                            RuntimeState.message = if (done) {
+                                when (direction) {
+                                    Direction.LEFT -> "이전 페이지 실행 · 손가락을 되돌리세요"
+                                    Direction.RIGHT -> "다음 페이지 실행 · 손가락을 되돌리세요"
+                                    Direction.UP -> "위로 스크롤 실행 · 손가락을 되돌리세요"
+                                    Direction.DOWN -> "아래로 스크롤 실행 · 손가락을 되돌리세요"
+                                }
+                            } else {
+                                if (direction == Direction.LEFT || direction == Direction.RIGHT) {
+                                    "페이지 넘김 전달 실패 · 대상 앱을 확인하세요"
+                                } else {
+                                    "스크롤 전달 실패 · 대상 앱을 확인하세요"
+                                }
+                            }
+                        } else {
+                            RuntimeState.message = when {
+                                right == null -> "오른손을 비춰주세요"
+                                !fingersTogether -> "오른손 검지와 중지를 모아주세요"
+                                twoFingerEngine.awaitingRelease -> "다시 움직이려면 모은 손가락을 되돌리세요"
+                                else -> "준비됨 · 모은 손가락을 위아래 또는 좌우로 움직이세요"
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    framesFailed++
+                    main.post {
+                        if (alive) {
+                            HandOverlayManager.update(emptyList())
+                            RuntimeState.message = "영상 분석 오류: ${e.message}"
+                        }
+                    }
+                    if (framesFailed >= 5) {
+                        main.post { if (alive) fail("영상 분석이 반복 실패했습니다 · 다시 START") }
+                    }
+                } finally {
+                    if (transformed !== raw) transformed?.recycle()
+                    raw?.recycle()
+                    frame.close()
+                }
+            }
+
+            private fun classifyHands(result: GestureRecognizerResult): List<DetectedHand> {
+                val landmarks = result.landmarks()
+                val gestures = result.gestures()
+                val handedness = result.handedness()
+                val hands = landmarks.mapIndexed { index, rawPoints ->
+                    val topGesture = gestures.getOrNull(index)?.firstOrNull()
+                    val handLabel = handedness.getOrNull(index)?.firstOrNull()?.let(::categoryLabel)
+                    DetectedHand(
+                        points = rawPoints.map { landmark -> landmark.x() to landmark.y() },
+                        gesture = topGesture?.categoryName(),
+                        score = topGesture?.score() ?: 0f,
+                        handedness = handLabel
+                    )
+                }
+                if (hands.isEmpty()) return emptyList()
+                // MediaPipe supplies handedness for normal selfie-camera input. The
+                // fallback keeps one visible hand usable on devices that omit a label.
+                if (hands.size == 1) {
+                    return listOf(hands.first().copy(handedness = "Right"))
+                }
+                val hasRight = hands.any { it.isRight }
+                val hasLeft = hands.any { it.isLeft }
+                if (hasRight && hasLeft) return hands
+
+                // If only one handedness label survived a frame, assign the unlabeled
+                // hand to the missing side. This prevents a temporary classifier gap
+                // from disabling either the right-hand scroll or left-fist trigger.
+                if (hasRight) return hands.map { if (it.isRight) it else it.copy(handedness = "Left") }
+                if (hasLeft) return hands.map { if (it.isLeft) it else it.copy(handedness = "Right") }
+
+                // On devices that omit handedness altogether, the mirrored selfie
+                // image places the user's right hand on the lower-x side in normal use.
+                val ordered = hands.sortedBy { it.palmCenter?.first ?: .5f }
+                return ordered.mapIndexed { index, hand ->
+                    hand.copy(handedness = if (index == 0) "Right" else "Left")
+                }
+            }
+
+            private fun categoryLabel(category: Category): String? {
+                val label = category.categoryName().ifBlank { category.displayName() }
+                return label.trim().lowercase(Locale.US).replace('-', '_').let {
+                    when {
+                        it == "right" || it == "right_hand" -> "Right"
+                        it == "left" || it == "left_hand" -> "Left"
+                        else -> label
+                    }
+                }
+            }
+
+            private fun fail(message: String) {
+                failed = true
+                RuntimeState.message = message
+                stopSelf()
+            }
+
+            private fun notification(): Notification {
+                val content = PendingIntent.getActivity(
+                    this,
+                    10,
+                    Intent(this, MainActivity::class.java),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                val stop = PendingIntent.getService(
+                    this,
+                    11,
+                    Intent(this, GestureCameraService::class.java).setAction(ACTION_STOP),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                return NotificationCompat.Builder(this, CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.ic_menu_camera)
+                    .setContentTitle("SC Hand Gesture")
+                    .setContentText("검지·중지 스크롤/페이지 · 왼손 주먹 터치")
+                    .setContentIntent(content)
+                    .setOngoing(true)
+                    .addAction(0, "중지", stop)
+                    .build()
+            }
+
+            override fun onDestroy() {
+                alive = false
+                RuntimeState.running = false
+                RuntimeState.lastFrame = 0L
+                if (!failed) RuntimeState.message = "중지됨"
+                main.removeCallbacksAndMessages(null)
+                runCatching { unregisterReceiver(screenOff) }
+                analysis?.clearAnalyzer()
+                analysis?.let { provider?.unbind(it) }
+                analysis = null
+                provider = null
+                HandOverlayManager.remove()
+                // Close the recognizer on the same serial worker that processes frames.
+                worker.execute { runCatching { recognizer?.close() }; recognizer = null }
+                worker.shutdown()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                super.onDestroy()
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/GestureEngine.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import kotlin.math.abs
+
+        enum class Direction { LEFT, RIGHT, UP, DOWN }
+        /** A fired gesture stays latched until a deliberate fist or prolonged absence. */
+        class GestureEngine {
+            private var locked = false
+            val awaitingRelease: Boolean get() = locked
+            private var releaseSince: Long? = null
+            private var origin: Pair<Float, Float>? = null
+            private var originAt = 0L
+            private var previousAt = -1L
+            fun reset() { locked = false; releaseSince = null; origin = null; previousAt = -1L }
+            fun sample(t: Long, x: Float, y: Float, open: Boolean, fist: Boolean,
+                       absent: Boolean, threshold: Float = .16f): Direction? {
+                if (previousAt >= 0 && t - previousAt > 350) { origin = null; releaseSince = null }
+                previousAt = t
+                if (locked) {
+                    if (fist || absent) {
+                        val since = releaseSince ?: t.also { releaseSince = it }
+                        if (t - since >= if (fist) 350L else 700L) {
+                            locked = false; origin = null; releaseSince = null
+                        }
+                    } else releaseSince = null
+                    return null
+                }
+                if (!open) { origin = null; return null }
+                val o = origin
+                if (o == null) { origin = x to y; originAt = t; return null }
+                val dx = x - o.first; val dy = y - o.second
+                if (t - originAt > 850) { origin = x to y; originAt = t; return null }
+                if (t - originAt < 120) return null
+                val direction = when {
+                    abs(dx) >= threshold && abs(dx) > abs(dy) * 1.4f -> if (dx > 0) Direction.RIGHT else Direction.LEFT
+                    abs(dy) >= threshold && abs(dy) > abs(dx) * 1.4f -> if (dy > 0) Direction.DOWN else Direction.UP
+                    else -> null
+                }
+                if (direction != null) { locked = true; origin = null; releaseSince = null }
+                return direction
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/HandOverlay.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+
+        import android.content.Context
+        import android.graphics.Canvas
+        import android.graphics.Color
+        import android.graphics.Paint
+        import android.graphics.Path
+        import android.graphics.PixelFormat
+        import android.os.Handler
+        import android.os.Looper
+        import android.view.Gravity
+        import android.view.View
+        import android.view.WindowManager
+        import kotlin.math.hypot
+
+        object HandOverlayManager {
+            private var wm: WindowManager? = null
+            private var view: HandOverlayView? = null
+            private val handler = Handler(Looper.getMainLooper())
+            private val stale = Runnable { view?.update(emptyList()) }
+
+            /** Updates both hands in one main-thread transaction. */
+            fun update(hands: List<DetectedHand>) {
+                check(Looper.myLooper() == Looper.getMainLooper())
+                val service = GestureAccessibilityService.instance ?: return
+                if (!service.getSharedPreferences("settings", Context.MODE_PRIVATE)
+                        .getBoolean("shadow", true)) {
+                    remove()
+                    return
+                }
+                if (view == null && hands.isNotEmpty()) {
+                    val manager = service.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                    val newView = HandOverlayView(service)
+                    val params = WindowManager.LayoutParams(
+                        -1,
+                        -1,
+                        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        PixelFormat.TRANSLUCENT
+                    ).apply { gravity = Gravity.TOP or Gravity.START }
+                    try {
+                        manager.addView(newView, params)
+                        wm = manager
+                        view = newView
+                    } catch (e: Exception) {
+                        RuntimeState.message = "그림자 표시 실패: ${e.message}"
+                    }
+                }
+                view?.update(hands)
+                handler.removeCallbacks(stale)
+                if (hands.isNotEmpty()) handler.postDelayed(stale, 450L)
+            }
+
+            fun remove() {
+                handler.removeCallbacks(stale)
+                view?.let { runCatching { wm?.removeView(it) } }
+                view = null
+                wm = null
+            }
+        }
+
+        class HandOverlayView(context: Context) : View(context) {
+            private var hands: List<DetectedHand> = emptyList()
+            private val rightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.BLACK
+                style = Paint.Style.FILL
+            }
+            private val leftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.rgb(45, 45, 45)
+                style = Paint.Style.FILL
+            }
+
+            fun update(newHands: List<DetectedHand>) {
+                val oldBySide = hands.associateBy { it.handedness?.lowercase() }
+                hands = newHands.map { next ->
+                    val old = oldBySide[next.handedness?.lowercase()]
+                    if (old != null && old.points.size == next.points.size) {
+                        next.copy(points = next.points.mapIndexed { index, point ->
+                            val previous = old.points[index]
+                            previous.first + (point.first - previous.first) * .55f to
+                                previous.second + (point.second - previous.second) * .55f
+                        })
+                    } else next
+                }
+                visibility = if (hands.isEmpty()) GONE else VISIBLE
+                invalidate()
+            }
+
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                if (hands.isEmpty() || width == 0 || height == 0) return
+                // One alpha layer keeps overlapping joints from becoming opaque.
+                val layer = canvas.saveLayerAlpha(0f, 0f, width.toFloat(), height.toFloat(), 112)
+                hands.forEach { drawHand(canvas, it) }
+                canvas.restoreToCount(layer)
+            }
+
+            private fun drawHand(canvas: Canvas, hand: DetectedHand) {
+                val p = hand.points.takeIf { it.size == 21 } ?: return
+                val activePaint = if (hand.isLeft) leftPaint else rightPaint
+                fun x(i: Int) = p[i].first * width
+                fun y(i: Int) = p[i].second * height
+                val palm = Path().apply {
+                    moveTo(x(0), y(0))
+                    for (i in intArrayOf(1, 2, 5, 9, 13, 17)) lineTo(x(i), y(i))
+                    close()
+                }
+                canvas.drawPath(palm, activePaint)
+                val base = hypot(x(5) - x(17), y(5) - y(17)).coerceAtLeast(12f) * .115f
+                val chains = arrayOf(
+                    intArrayOf(1, 2, 3, 4),
+                    intArrayOf(5, 6, 7, 8),
+                    intArrayOf(9, 10, 11, 12),
+                    intArrayOf(13, 14, 15, 16),
+                    intArrayOf(17, 18, 19, 20)
+                )
+                for (chain in chains) {
+                    for (j in 0..2) {
+                        val a = chain[j]
+                        val b = chain[j + 1]
+                        val ra = base * (1f - j * .15f)
+                        val rb = base * (.85f - j * .15f)
+                        val dx = x(b) - x(a)
+                        val dy = y(b) - y(a)
+                        val len = hypot(dx, dy).coerceAtLeast(1f)
+                        val nx = -dy / len
+                        val ny = dx / len
+                        val finger = Path().apply {
+                            moveTo(x(a) + nx * ra, y(a) + ny * ra)
+                            lineTo(x(b) + nx * rb, y(b) + ny * rb)
+                            lineTo(x(b) - nx * rb, y(b) - ny * rb)
+                            lineTo(x(a) - nx * ra, y(a) - ny * ra)
+                            close()
+                        }
+                        canvas.drawPath(finger, activePaint)
+                        canvas.drawCircle(x(a), y(a), ra, activePaint)
+                        canvas.drawCircle(x(b), y(b), rb, activePaint)
+                    }
+                }
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/HandTypes.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+
+        import kotlin.math.hypot
+
+        /** A single MediaPipe hand in display-oriented normalized coordinates. */
+        data class DetectedHand(
+            val points: List<Pair<Float, Float>>,
+            val gesture: String?,
+            val score: Float,
+            val handedness: String?
+        ) {
+            val isRight: Boolean
+                get() = handedness.equals("Right", ignoreCase = true)
+
+            val isLeft: Boolean
+                get() = handedness.equals("Left", ignoreCase = true)
+
+            val openPalm: Boolean
+                get() = gesture.equals("Open_Palm", ignoreCase = true) && score >= 0.55f
+
+            val closedFist: Boolean
+                get() = gesture.equals("Closed_Fist", ignoreCase = true) && score >= 0.45f || geometricFist
+
+            /** Uses landmarks as a fallback when the canned gesture classifier flickers. */
+            val geometricFist: Boolean
+                get() {
+                    if (points.size != 21) return false
+                    val wrist = points[0]
+                    val pairs = arrayOf(8 to 6, 12 to 10, 16 to 14, 20 to 18)
+                    val folded = pairs.count { (tip, joint) ->
+                        distance(points[tip], wrist) <= distance(points[joint], wrist) * 1.10f
+                    }
+                    return folded >= 3
+                }
+
+            /** True when the index and middle fingertips are intentionally brought together. */
+            val indexMiddleTogether: Boolean
+                get() {
+                    if (points.size != 21) return false
+                    val palmWidth = distance(points[5], points[17]).coerceAtLeast(0.01f)
+                    val fingertipDistance = distance(points[8], points[12])
+                    val indexExtended = distance(points[8], points[0]) > distance(points[6], points[0]) * 1.04f
+                    val middleExtended = distance(points[12], points[0]) > distance(points[10], points[0]) * 1.04f
+                    return fingertipDistance <= palmWidth * 0.52f && indexExtended && middleExtended
+                }
+
+            val indexTip: Pair<Float, Float>?
+                get() = points.getOrNull(8)
+
+            /** The midpoint of the two active fingertips, used as the gesture cursor. */
+            val indexMiddleCenter: Pair<Float, Float>?
+                get() {
+                    if (points.size <= 12) return null
+                    return (points[8].first + points[12].first) / 2f to
+                        (points[8].second + points[12].second) / 2f
+                }
+
+            val palmCenter: Pair<Float, Float>?
+                get() {
+                    if (points.size < 18) return null
+                    val ids = intArrayOf(0, 5, 9, 13, 17)
+                    return ids.map { points[it] }.let { values ->
+                        values.map { it.first }.average().toFloat() to
+                            values.map { it.second }.average().toFloat()
+                    }
+                }
+
+            private fun distance(a: Pair<Float, Float>, b: Pair<Float, Float>): Float = hypot(
+                (a.first - b.first).toDouble(),
+                (a.second - b.second).toDouble()
+            ).toFloat()
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/MainActivity.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import android.Manifest
+        import android.content.Intent
+        import android.content.pm.PackageManager
+        import android.graphics.Color
+        import android.os.Bundle
+        import android.os.Build
+        import android.os.Handler
+        import android.os.Looper
+        import android.os.SystemClock
+        import android.provider.Settings
+        import android.view.Gravity
+        import android.widget.*
+        import androidx.activity.result.contract.ActivityResultContracts
+        import androidx.appcompat.app.AppCompatActivity
+        import androidx.core.content.ContextCompat
+        import androidx.core.view.ViewCompat
+        import androidx.core.view.WindowInsetsCompat
+
+        class MainActivity : AppCompatActivity() {
+            private lateinit var status: TextView
+            private val handler = Handler(Looper.getMainLooper())
+            private val permission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { updateStatus() }
+            private val refresh = object : Runnable {
+                override fun run() { updateStatus(); handler.postDelayed(this, 600) }
+            }
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+                val root = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+                    setPadding(32, 32, 32, 32); setBackgroundColor(Color.rgb(17,17,17))
+                }
+                fun label(s: String, size: Float = 16f) = TextView(this).apply {
+                    text = s; textSize = size; setTextColor(Color.WHITE); setPadding(0,18,0,18)
+                    root.addView(this)
+                }
+                label("SC Hand Gesture", 28f)
+                label("by sc\n\n오른손 검지와 중지를 모은 상태에서 위아래로 움직이면 스크롤됩니다.\n같은 자세로 좌우로 움직이면 이전/다음 페이지를 넘깁니다.\n왼손을 주먹 쥐는 순간, 오른손 검지 끝 위치를 한 번 터치합니다.\n\n왼손 주먹을 계속 쥐고 있어도 반복 터치되지 않습니다.\n왼손을 다시 펴거나 카메라 밖으로 빼면 다음 터치가 준비됩니다.\nSTART 후 원하는 앱을 직접 여세요.")
+                status = label("")
+                fun button(s: String, block: () -> Unit) { root.addView(Button(this).apply {
+                    text = s; setOnClickListener { block() }
+                }) }
+                button("1. 카메라·알림 권한") {
+                    permission.launch(if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.CAMERA, Manifest.permission.POST_NOTIFICATIONS) else arrayOf(Manifest.permission.CAMERA))
+                }
+                button("2. 접근성 서비스 켜기") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                button("START") {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                        permission.launch(arrayOf(Manifest.permission.CAMERA))
+                    } else if (GestureAccessibilityService.instance == null) {
+                        Toast.makeText(this,"접근성 서비스를 먼저 켜주세요.",Toast.LENGTH_LONG).show()
+                        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    } else {
+                        runCatching { ContextCompat.startForegroundService(this, Intent(this, GestureCameraService::class.java)) }
+                            .onFailure { RuntimeState.message = "시작 실패: ${it.message}" }
+                    }
+                    updateStatus()
+                }
+                button("STOP") { stopService(Intent(this, GestureCameraService::class.java)); updateStatus() }
+                fun toggle(key: String, s: String, default: Boolean = false) {
+                    root.addView(Switch(this).apply {
+                        text = s; setTextColor(Color.WHITE); isChecked = prefs.getBoolean(key, default)
+                        setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(key, checked).apply() }
+                    })
+                }
+                toggle("reverseY", "상하 방향 반전")
+                toggle("shadow", "손 그림자 표시", true)
+                fun slider(key: String, title: String, default: Int) {
+                    val text = label("$title: ${prefs.getInt(key, default)}")
+                    root.addView(SeekBar(this).apply {
+                        max = 100; progress = prefs.getInt(key, default)
+                        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                            override fun onProgressChanged(v: SeekBar?, n: Int, fromUser: Boolean) {
+                                text.text = "$title: $n"; prefs.edit().putInt(key,n).apply()
+                            }
+                            override fun onStartTrackingTouch(v: SeekBar?) = Unit
+                            override fun onStopTrackingTouch(v: SeekBar?) = Unit
+                        })
+                    })
+                }
+                slider("sensitivity", "민감도 (높을수록 작은 움직임)", 50)
+                slider("distance", "스크롤 거리", 50)
+                label("화면 잠금 시 인식을 중지합니다.\n오른손과 왼손 그림자를 모두 표시합니다. 영상은 기기에서 처리하며 저장·전송하지 않습니다.")
+                val scroll = ScrollView(this).apply { addView(root) }
+                setContentView(scroll)
+                ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->
+                    val b = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+                    v.setPadding(b.left,b.top,b.right,b.bottom); insets
+                }
+            }
+            override fun onResume() { super.onResume(); handler.post(refresh) }
+            override fun onPause() { handler.removeCallbacks(refresh); super.onPause() }
+            private fun updateStatus() {
+                if (!::status.isInitialized) return
+                val camera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                val receiving = RuntimeState.running && SystemClock.uptimeMillis() - RuntimeState.lastFrame < 2000
+                status.text = "카메라 권한: ${if(camera) "허용" else "필요"}\n접근성 연결: ${if(GestureAccessibilityService.instance != null) "연결됨" else "필요"}\n실제 영상 수신: ${if(receiving) "수신 중" else "없음"}\n${RuntimeState.message}"
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/PageEngine.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+
+        import kotlin.math.abs
+
+        /** One horizontal page-turn event while the index and middle fingers touch. */
+        class PageEngine {
+            private var originX: Float? = null
+            private var originAt = 0L
+            private var previousAt = -1L
+            private var locked = false
+            private var releaseSince: Long? = null
+
+            val awaitingRelease: Boolean get() = locked
+
+            fun reset() {
+                originX = null
+                originAt = 0L
+                previousAt = -1L
+                locked = false
+                releaseSince = null
+            }
+
+            fun sample(now: Long, x: Float?, together: Boolean, threshold: Float = .18f): Direction? {
+                if (previousAt >= 0L && now - previousAt > 450L) {
+                    originX = null
+                    releaseSince = null
+                }
+                previousAt = now
+                if (!together || x == null) {
+                    if (locked) {
+                        val since = releaseSince ?: now.also { releaseSince = it }
+                        if (now - since >= 500L) reset()
+                    } else {
+                        originX = null
+                    }
+                    return null
+                }
+                if (locked) {
+                    val origin = originX
+                    if (origin != null && abs(x - origin) <= threshold * .35f) {
+                        val since = releaseSince ?: now.also { releaseSince = it }
+                        if (now - since >= 220L) {
+                            locked = false
+                            releaseSince = null
+                            originX = x
+                            originAt = now
+                        }
+                    } else {
+                        releaseSince = null
+                    }
+                    return null
+                }
+                val origin = originX
+                if (origin == null) {
+                    originX = x
+                    originAt = now
+                    return null
+                }
+                if (now - originAt < 120L) return null
+                if (now - originAt > 900L) {
+                    originX = x
+                    originAt = now
+                    return null
+                }
+                val dx = x - origin
+                if (abs(dx) < threshold) return null
+                locked = true
+                return if (dx > 0f) Direction.RIGHT else Direction.LEFT
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/RuntimeState.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        object RuntimeState {
+            @Volatile var running = false
+            @Volatile var message = "중지됨"
+            @Volatile var lastFrame = 0L
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/ScrollEngine.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+
+        import kotlin.math.abs
+
+        /**
+         * One-shot vertical scroll detector. It rearms only after the hand returns
+         * close to its starting height or disappears, so one long hand movement does
+         * not produce a stream of accidental swipes.
+         */
+        class ScrollEngine {
+            private var originY: Float? = null
+            private var originAt = 0L
+            private var previousY: Float? = null
+            private var previousAt = -1L
+            private var locked = false
+            private var releaseSince: Long? = null
+
+            val awaitingRelease: Boolean get() = locked
+
+            fun reset() {
+                originY = null
+                originAt = 0L
+                previousY = null
+                previousAt = -1L
+                locked = false
+                releaseSince = null
+            }
+
+            fun sample(
+                now: Long,
+                y: Float?,
+                active: Boolean,
+                threshold: Float = 0.16f
+            ): Direction? {
+                if (previousAt >= 0L && now - previousAt > 450L) {
+                    originY = null
+                    previousY = null
+                    releaseSince = null
+                }
+                previousAt = now
+
+                if (!active || y == null) {
+                    previousY = null
+                    if (locked) {
+                        val since = releaseSince ?: now.also { releaseSince = it }
+                        if (now - since >= 700L) reset()
+                    } else {
+                        originY = null
+                    }
+                    return null
+                }
+
+                if (locked) {
+                    val origin = originY
+                    if (origin != null && abs(y - origin) <= threshold * 0.35f) {
+                        val since = releaseSince ?: now.also { releaseSince = it }
+                        if (now - since >= 220L) {
+                            locked = false
+                            releaseSince = null
+                            originY = y
+                            originAt = now
+                        }
+                    } else {
+                        releaseSince = null
+                    }
+                    previousY = y
+                    return null
+                }
+
+                val origin = originY
+                if (origin == null) {
+                    originY = y
+                    originAt = now
+                    previousY = y
+                    return null
+                }
+                if (now - originAt < 120L) {
+                    previousY = y
+                    return null
+                }
+                if (now - originAt > 900L) {
+                    originY = y
+                    originAt = now
+                    previousY = y
+                    return null
+                }
+
+                val dy = y - origin
+                if (abs(dy) < threshold) {
+                    previousY = y
+                    return null
+                }
+
+                locked = true
+                previousY = y
+                return if (dy < 0f) Direction.UP else Direction.DOWN
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/TapTrigger.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+
+        import kotlin.math.hypot
+
+        /** Fires once on a confirmed left-fist transition, then waits for release. */
+        class TapTrigger {
+            private var armed = true
+            private var fistSince: Long? = null
+            private var nonFistSince: Long? = null
+            private var candidate: Pair<Float, Float>? = null
+            private var stableSince: Long? = null
+
+            fun reset() {
+                armed = true
+                fistSince = null
+                nonFistSince = null
+                candidate = null
+                stableSince = null
+            }
+
+            fun sample(
+                now: Long,
+                leftFist: Boolean,
+                rightIndex: Pair<Float, Float>?
+            ): Pair<Float, Float>? {
+                if (!leftFist) {
+                    fistSince = null
+                    candidate = null
+                    stableSince = null
+                    val since = nonFistSince ?: now.also { nonFistSince = it }
+                    if (now - since >= 250L) armed = true
+                    return null
+                }
+
+                nonFistSince = null
+                if (!armed || rightIndex == null) return null
+                val fistAt = fistSince ?: now.also { fistSince = it }
+                val old = candidate
+                if (old == null) {
+                    candidate = rightIndex
+                    stableSince = now
+                    return null
+                }
+
+                val movement = hypot(
+                    (rightIndex.first - old.first).toDouble(),
+                    (rightIndex.second - old.second).toDouble()
+                ).toFloat()
+                if (movement > 0.035f) {
+                    candidate = rightIndex
+                    stableSince = now
+                    return null
+                }
+
+                val stableAt = stableSince ?: now.also { stableSince = it }
+                if (now - fistAt >= 140L && now - stableAt >= 100L) {
+                    armed = false
+                    fistSince = null
+                    candidate = null
+                    stableSince = null
+                    return rightIndex
+                }
+                return null
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/java/com/sc/millegesture
+        cat > generated-android/app/src/main/java/com/sc/millegesture/TwoFingerGestureEngine.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+
+        import kotlin.math.abs
+        import kotlin.math.hypot
+
+        /**
+         * One-shot input engine for the index-and-middle-fingertip-together pose.
+         *
+         * The same pose deliberately owns both axes: the dominant vertical movement
+         * becomes a scroll and the dominant horizontal movement becomes a page turn.
+         * A single movement can therefore never fire both actions on a diagonal path.
+         */
+        class TwoFingerGestureEngine {
+            private companion object {
+                const val POSE_DROPOUT_MS = 180L
+            }
+
+            private var origin: Pair<Float, Float>? = null
+            private var originAt = 0L
+            private var previousAt = -1L
+            private var locked = false
+            private var releaseSince: Long? = null
+
+            val awaitingRelease: Boolean get() = locked
+
+            fun reset() {
+                origin = null
+                originAt = 0L
+                previousAt = -1L
+                locked = false
+                releaseSince = null
+            }
+
+            /** Returns one direction after a deliberate movement, or null otherwise. */
+            fun sample(
+                now: Long,
+                point: Pair<Float, Float>?,
+                together: Boolean,
+                threshold: Float = 0.145f
+            ): Direction? {
+                if (previousAt >= 0L && now - previousAt > 500L) reset()
+                previousAt = now
+
+                if (!together || point == null) {
+                    if (locked) {
+                        val since = releaseSince ?: now.also { releaseSince = it }
+                        if (now - since >= 550L) reset()
+                    } else {
+                        // A single missed landmark frame should not erase the gesture
+                        // origin. This grace period is what makes the input usable in
+                        // ordinary lighting instead of requiring classifier-perfect
+                        // continuity.
+                        val since = releaseSince ?: now.also { releaseSince = it }
+                        if (now - since >= POSE_DROPOUT_MS) {
+                            origin = null
+                            releaseSince = null
+                        }
+                    }
+                    return null
+                }
+
+                if (locked) {
+                    val start = origin
+                    if (start != null && distance(point, start) <= threshold * 0.35f) {
+                        val since = releaseSince ?: now.also { releaseSince = it }
+                        if (now - since >= 220L) {
+                            locked = false
+                            releaseSince = null
+                            origin = point
+                            originAt = now
+                        }
+                    } else {
+                        releaseSince = null
+                    }
+                    return null
+                }
+
+                releaseSince = null
+
+                val start = origin
+                if (start == null) {
+                    origin = point
+                    originAt = now
+                    return null
+                }
+                if (now - originAt < 120L) return null
+                if (now - originAt > 900L) {
+                    origin = point
+                    originAt = now
+                    return null
+                }
+
+                val dx = point.first - start.first
+                val dy = point.second - start.second
+                if (maxOf(abs(dx), abs(dy)) < threshold) return null
+
+                // Pick one dominant axis so a diagonal movement cannot scroll and turn
+                // a page in the same frame.
+                val direction = if (abs(dx) >= abs(dy)) {
+                    if (dx > 0f) Direction.RIGHT else Direction.LEFT
+                } else {
+                    if (dy > 0f) Direction.DOWN else Direction.UP
+                }
+                locked = true
+                return direction
+            }
+
+            private fun distance(a: Pair<Float, Float>, b: Pair<Float, Float>): Float = hypot(
+                (a.first - b.first).toDouble(),
+                (a.second - b.second).toDouble()
+            ).toFloat()
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/drawable
+        cat > generated-android/app/src/main/res/drawable/ic_launcher_foreground.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <vector xmlns:android="http://schemas.android.com/apk/res/android"
+            android:width="108dp"
+            android:height="108dp"
+            android:viewportWidth="108"
+            android:viewportHeight="108">
+            <path
+                android:fillColor="#D92525"
+                android:pathData="M15,15h78v78h-78z"/>
+            <path
+                android:fillColor="#FFFFFF"
+                android:pathData="M29,51h33l-10,-10l7,-7l22,20l-22,20l-7,-7l10,-10h-33z"/>
+        </vector>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/values
+        cat > generated-android/app/src/main/res/values/colors.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <resources>
+            <color name="black">#111111</color>
+            <color name="white">#FFFFFF</color>
+            <color name="red">#D92525</color>
+            <color name="gray">#707070</color>
+        </resources>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/values
+        cat > generated-android/app/src/main/res/values/strings.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <resources>
+            <string name="app_name">SC Hand Gesture</string>
+            <string name="accessibility_description">사용자가 시작한 손 제스처에 따라 현재 앱을 탭하거나 스크롤합니다. 화면 내용과 카메라 영상은 저장하거나 전송하지 않습니다.</string>
+        </resources>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/values
+        cat > generated-android/app/src/main/res/values/themes.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <resources>
+            <style name="Theme.SCMilleGesture" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+                <item name="colorPrimary">@color/red</item>
+                <item name="colorPrimaryVariant">@color/red</item>
+                <item name="colorOnPrimary">@color/white</item>
+                <item name="android:fontFamily">sans</item>
+                <item name="android:windowLightStatusBar">false</item>
+            </style>
+        </resources>
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/res/xml
+        cat > generated-android/app/src/main/res/xml/accessibility_service_config.xml <<'SC_FILE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <accessibility-service
+            xmlns:android="http://schemas.android.com/apk/res/android"
+            android:description="@string/accessibility_description"
+            android:accessibilityEventTypes="typeWindowStateChanged"
+            android:accessibilityFeedbackType="feedbackGeneric"
+            android:notificationTimeout="100"
+            android:canRetrieveWindowContent="true"
+            android:canPerformGestures="true"
+            android:accessibilityFlags="flagRetrieveInteractiveWindows" />
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/test/java/com/sc/millegesture
+        cat > generated-android/app/src/test/java/com/sc/millegesture/GestureEngineTest.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+        import org.junit.Assert.*
+        import org.junit.Test
+        class GestureEngineTest {
+            private fun fire(e: GestureEngine, dx:Float, dy:Float, t:Long=0):Direction? {
+                e.sample(t,.5f,.5f,true,false,false)
+                return e.sample(t+200,.5f+dx,.5f+dy,true,false,false)
+            }
+            @Test fun fourDirections() {
+                assertEquals(Direction.RIGHT,fire(GestureEngine(),.2f,0f))
+                assertEquals(Direction.LEFT,fire(GestureEngine(),-.2f,0f))
+                assertEquals(Direction.UP,fire(GestureEngine(),0f,-.2f))
+                assertEquals(Direction.DOWN,fire(GestureEngine(),0f,.2f))
+            }
+            @Test fun returnDoesNotFireEvenAfterCooldown() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                for(t in 300L..3000L step 100) assertNull(e.sample(t,.3f,.5f,true,false,false))
+            }
+            @Test fun briefDropoutDoesNotUnlock() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                e.sample(300,0f,0f,false,false,true)
+                assertNull(e.sample(400,.7f,.5f,true,false,false))
+                assertNull(e.sample(600,.3f,.5f,true,false,false))
+            }
+            @Test fun heldFistUnlocks() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                for(t in 300L..700L step 100) e.sample(t,.5f,.5f,false,true,false)
+                assertEquals(Direction.LEFT,fire(e,-.2f,0f,800))
+            }
+            @Test fun absentHandUnlocksAfterDelay() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                for(t in 300L..1100L step 100) e.sample(t,0f,0f,false,false,true)
+                assertEquals(Direction.UP,fire(e,0f,-.2f,1200))
+            }
+            @Test fun slowMoveAndJitterDoNotFire() {
+                val e=GestureEngine()
+                for(t in 0L..2000L step 100) assertNull(e.sample(t,.5f+t*.00003f,.5f,true,false,false))
+            }
+            @Test fun diagonalIsIgnored() { assertNull(fire(GestureEngine(),.2f,.2f)) }
+            @Test fun stalledStreamDoesNotRearm() {
+                val e=GestureEngine(); fire(e,.2f,0f)
+                e.sample(300,0f,0f,false,false,true)
+                e.sample(2000,0f,0f,false,false,true)
+                assertNull(fire(e,-.2f,0f,2100))
+            }
+            @Test fun heldPalmCanMoveLater() {
+                val e=GestureEngine()
+                for(t in 0L..3000L step 100) e.sample(t,.5f,.5f,true,false,false)
+                assertEquals(Direction.RIGHT,e.sample(3200,.72f,.5f,true,false,false))
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/test/java/com/sc/millegesture
+        cat > generated-android/app/src/test/java/com/sc/millegesture/TwoHandGestureTest.kt <<'SC_FILE_EOF'
+        package com.sc.millegesture
+
+        import org.junit.Assert.assertEquals
+        import org.junit.Assert.assertNull
+        import org.junit.Test
+
+        class TwoHandGestureTest {
+            @Test fun joinedFingersScrollVertically() {
+                val engine = TwoFingerGestureEngine()
+                assertNull(engine.sample(0L, .50f to .50f, true))
+                assertEquals(Direction.UP, engine.sample(220L, .50f to .30f, true))
+            }
+
+            @Test fun joinedFingersTurnPagesHorizontally() {
+                val engine = TwoFingerGestureEngine()
+                assertNull(engine.sample(0L, .50f to .50f, true))
+                assertEquals(Direction.RIGHT, engine.sample(220L, .72f to .51f, true))
+            }
+
+            @Test fun dominantAxisWinsOnDiagonalMovement() {
+                val engine = TwoFingerGestureEngine()
+                engine.sample(0L, .50f to .50f, true)
+                assertEquals(Direction.DOWN, engine.sample(220L, .58f to .71f, true))
+            }
+
+            @Test fun joinedFingersDoNotRepeatUntilTheyReturn() {
+                val engine = TwoFingerGestureEngine()
+                engine.sample(0L, .50f to .50f, true)
+                assertEquals(Direction.LEFT, engine.sample(220L, .28f to .49f, true))
+                assertNull(engine.sample(450L, .10f to .49f, true))
+                engine.sample(650L, .50f to .50f, true)
+                engine.sample(900L, .50f to .50f, true)
+                assertEquals(Direction.RIGHT, engine.sample(1130L, .73f to .50f, true))
+            }
+
+            @Test fun separatedFingersNeverCreateInput() {
+                val engine = TwoFingerGestureEngine()
+                assertNull(engine.sample(0L, .50f to .50f, false))
+                assertNull(engine.sample(220L, .15f to .15f, false))
+                assertNull(engine.sample(500L, .85f to .85f, false))
+            }
+
+            @Test fun briefPoseDropoutKeepsTheGestureOrigin() {
+                val engine = TwoFingerGestureEngine()
+                engine.sample(0L, .50f to .50f, true)
+                assertNull(engine.sample(100L, .50f to .50f, false))
+                assertEquals(Direction.UP, engine.sample(220L, .50f to .30f, true))
+            }
+
+            @Test fun scrollUsesVerticalDirection() {
+                val engine = ScrollEngine()
+                assertNull(engine.sample(0L, .50f, true))
+                assertEquals(Direction.UP, engine.sample(220L, .25f, true))
+
+                val second = ScrollEngine()
+                assertNull(second.sample(0L, .50f, true))
+                assertEquals(Direction.DOWN, second.sample(220L, .75f, true))
+            }
+
+            @Test fun scrollDoesNotRepeatWhileHandKeepsMoving() {
+                val engine = ScrollEngine()
+                engine.sample(0L, .50f, true)
+                assertEquals(Direction.UP, engine.sample(220L, .25f, true))
+                assertNull(engine.sample(400L, .10f, true))
+                assertNull(engine.sample(600L, .05f, true))
+            }
+
+            @Test fun scrollRearmsAfterHandReturns() {
+                val engine = ScrollEngine()
+                engine.sample(0L, .50f, true)
+                assertEquals(Direction.UP, engine.sample(220L, .25f, true))
+                engine.sample(400L, .50f, true)
+                engine.sample(650L, .50f, true)
+                engine.sample(700L, .50f, true)
+                assertEquals(Direction.DOWN, engine.sample(950L, .78f, true))
+            }
+
+            @Test fun closedLeftHandFiresOneTapOnly() {
+                val trigger = TapTrigger()
+                val point = .42f to .37f
+                assertNull(trigger.sample(0L, false, point))
+                assertNull(trigger.sample(300L, true, point))
+                assertEquals(point, trigger.sample(460L, true, point))
+                assertNull(trigger.sample(700L, true, point))
+                assertNull(trigger.sample(800L, true, point))
+            }
+
+            @Test fun releasingLeftFistRearmsTap() {
+                val trigger = TapTrigger()
+                val point = .42f to .37f
+                trigger.sample(0L, false, point)
+                trigger.sample(300L, true, point)
+                assertEquals(point, trigger.sample(460L, true, point))
+                trigger.sample(600L, false, point)
+                trigger.sample(900L, false, point)
+                assertNull(trigger.sample(1000L, true, point))
+                assertEquals(point, trigger.sample(1160L, true, point))
+            }
+
+            @Test fun movingIndexWaitsBeforeTap() {
+                val trigger = TapTrigger()
+                trigger.sample(0L, false, .40f to .40f)
+                trigger.sample(300L, true, .40f to .40f)
+                assertNull(trigger.sample(460L, true, .48f to .40f))
+                assertNull(trigger.sample(500L, true, .48f to .40f))
+                assertEquals(.48f to .40f, trigger.sample(620L, true, .48f to .40f))
+            }
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/.
+        cat > generated-android/build.gradle.kts <<'SC_FILE_EOF'
+        plugins {
+            id("com.android.application") version "8.7.3" apply false
+            id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+        }
+        SC_FILE_EOF
+        mkdir -p generated-android/.
+        cat > generated-android/gradle.properties <<'SC_FILE_EOF'
+        org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+        android.useAndroidX=true
+        kotlin.code.style=official
+        SC_FILE_EOF
+        mkdir -p generated-android/.
+        cat > generated-android/settings.gradle.kts <<'SC_FILE_EOF'
+        pluginManagement {
+            repositories {
+                google()
+                mavenCentral()
+                gradlePluginPortal()
+            }
+        }
+
+        dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories {
+                google()
+                mavenCentral()
+            }
+        }
+
+        rootProject.name = "SCMilleGesture"
+        include(":app")
+        SC_FILE_EOF
+        mkdir -p generated-android/app/src/main/assets
+        curl -fL --retry 3 "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task" -o generated-android/app/src/main/assets/gesture_recognizer.task
+    - name: Tests, APK and lint
+      working-directory: generated-android
+      run: gradle --no-daemon --max-workers=2 :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: SC-Hand-Gesture-v4-APK
+        path: generated-android/app/build/outputs/apk/debug/app-debug.apk
+        if-no-files-found: error
+        retention-days: 30
+    - name: Upload verification reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: SC-Hand-Gesture-reports
+        path: generated-android/app/build/reports/
+        if-no-files-found: ignore
