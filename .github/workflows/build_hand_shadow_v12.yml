@@ -355,8 +355,10 @@ jobs:
                   val span = .22f + .48f * prefs.getInt("distance", 50).coerceIn(0, 100) / 100f
                   when (direction) {
                       Direction.LEFT, Direction.RIGHT -> {
+                          var right = direction == Direction.RIGHT
+                          if (prefs.getBoolean("reverseX", false)) right = !right
                           val delta = b.width() * span / 2f
-                          if (direction == Direction.RIGHT) {
+                          if (right) {
                               path.moveTo(cx - delta, cy)
                               path.lineTo(cx + delta, cy)
                           } else {
@@ -425,12 +427,10 @@ jobs:
           import androidx.lifecycle.LifecycleService
           import com.google.mediapipe.framework.image.BitmapImageBuilder
           import com.google.mediapipe.tasks.components.containers.Category
-          import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
           import com.google.mediapipe.tasks.core.BaseOptions
           import com.google.mediapipe.tasks.vision.core.RunningMode
-          import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizer
-          import com.google.mediapipe.tasks.vision.gesturerecognizer.GestureRecognizerResult
-          import java.util.Locale
+          import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+          import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
           import java.util.concurrent.Executors
           
           class GestureCameraService : LifecycleService() {
@@ -444,9 +444,10 @@ jobs:
               private val main = Handler(Looper.getMainLooper())
               private var provider: ProcessCameraProvider? = null
               private var analysis: ImageAnalysis? = null
-              private var recognizer: GestureRecognizer? = null // Created and closed on worker.
+              private var landmarker: HandLandmarker? = null // Created and closed on worker.
               private val twoFingerEngine = TwoFingerGestureEngine() // Used only on main.
               private val rightInputEngine = RightHandInputEngine() // Used only on main.
+              private val rightPinchStabilizer = RightPinchPoseStabilizer() // Used only on main.
               @Volatile private var alive = true
               private var started = false
               private var failed = false
@@ -454,6 +455,8 @@ jobs:
               private var startAt = 0L
               private var lastRotation = -1
               private var framesFailed = 0
+              private var lastRightPalm: Pair<Float, Float>? = null // Worker thread only.
+              private var lastLeftPalm: Pair<Float, Float>? = null // Worker thread only.
           
               private val screenOff = object : BroadcastReceiver() {
                   override fun onReceive(context: Context?, intent: Intent?) { stopSelf() }
@@ -517,14 +520,15 @@ jobs:
                   startAt = SystemClock.uptimeMillis()
                   twoFingerEngine.reset()
                   rightInputEngine.reset()
+                  rightPinchStabilizer.reset()
                   main.post(watchdog)
           
                   worker.execute {
                       try {
-                          val options = GestureRecognizer.GestureRecognizerOptions.builder()
+                          val options = HandLandmarker.HandLandmarkerOptions.builder()
                               .setBaseOptions(
                                   BaseOptions.builder()
-                                      .setModelAssetPath("gesture_recognizer.task")
+                                      .setModelAssetPath("hand_landmarker.task")
                                       .build()
                               )
                               .setRunningMode(RunningMode.VIDEO)
@@ -536,7 +540,7 @@ jobs:
                               .setMinHandPresenceConfidence(.45f)
                               .setMinTrackingConfidence(.45f)
                               .build()
-                          if (alive) recognizer = GestureRecognizer.createFromOptions(this, options)
+                          if (alive) landmarker = HandLandmarker.createFromOptions(this, options)
                           main.post { if (alive) startCamera() }
                       } catch (e: Exception) {
                           main.post { if (alive) fail("인식 모델 오류: ${e.message}") }
@@ -601,6 +605,7 @@ jobs:
                                   rightInputEngine.reset()?.let {
                                       GestureAccessibilityService.instance?.endDrag()
                                   }
+                                  rightPinchStabilizer.reset()
                                   HandOverlayManager.update(emptyList())
                               }
                           }
@@ -620,7 +625,7 @@ jobs:
                       transformed = rotated
                       val image = BitmapImageBuilder(rotated).build()
                       val result = try {
-                          recognizer?.recognizeForVideo(image, now)
+                          landmarker?.detectForVideo(image, now)
                       } finally {
                           image.close()
                       }
@@ -630,8 +635,8 @@ jobs:
                       val right = hands.firstOrNull { it.isRight }
                       val left = hands.firstOrNull { it.isLeft }
                       val shadows = hands.filter { it.points.size == 21 }
-                      val clickPinch = right?.thumbIndexPinch == true
-                      val volumePinch = right?.thumbMiddlePinch == true
+                      val indexRatio = right?.thumbIndexRatio
+                      val middleRatio = right?.thumbMiddleRatio
                       // Use the physical pinch centre rather than the index fingertip.
                       // This averages landmark jitter from both fingers and keeps taps,
                       // held input and drag movement on one consistent coordinate.
@@ -644,6 +649,9 @@ jobs:
                       main.post {
                           if (!alive || SystemClock.uptimeMillis() - now > 450L) return@post
                           HandOverlayManager.update(shadows)
+                          val stablePinch = rightPinchStabilizer.sample(now, indexRatio, middleRatio)
+                          val clickPinch = stablePinch.index
+                          val volumePinch = stablePinch.middle
                           val rightAction = rightInputEngine.sample(
                               now,
                               clickPinch,
@@ -656,6 +664,7 @@ jobs:
                               val accessibility = GestureAccessibilityService.instance
                               RuntimeState.message = when (rightAction) {
                                   is RightHandAction.Tap -> {
+                                      HandOverlayManager.showCursor(rightAction.point, pulse = true)
                                       if (accessibility?.tapAt(
                                               rightAction.point.first,
                                               rightAction.point.second
@@ -663,6 +672,7 @@ jobs:
                                       ) "클릭 실행" else "클릭 전달 실패 · 대상 앱을 확인하세요"
                                   }
                                   is RightHandAction.DragStart -> {
+                                      HandOverlayManager.showCursor(rightAction.current, pulse = true)
                                       if (accessibility?.startDrag(
                                               rightAction.start,
                                               rightAction.current
@@ -675,6 +685,7 @@ jobs:
                                       }
                                   }
                                   is RightHandAction.DragMove -> {
+                                      HandOverlayManager.showCursor(rightAction.point)
                                       if (accessibility?.moveDrag(rightAction.point) == true) {
                                           "드래그 중 · 핀치를 풀면 놓기"
                                       } else {
@@ -694,6 +705,9 @@ jobs:
           
                           if (rightInputEngine.blocksLeft) {
                               twoFingerEngine.reset()
+                              if (clickPinch && pointerPoint != null) {
+                                  HandOverlayManager.showCursor(pointerPoint)
+                              }
                               RuntimeState.message = when {
                                   volumePinch -> "음량 조절 · 오른손을 위아래로 움직이세요"
                                   clickPinch -> "오른손 핀치 · 놓으면 클릭, 움직이면 드래그"
@@ -751,52 +765,93 @@ jobs:
                   }
               }
           
-              private fun classifyHands(result: GestureRecognizerResult): List<DetectedHand> {
+              private fun classifyHands(result: HandLandmarkerResult): List<DetectedHand> {
                   val landmarks = result.landmarks()
-                  val gestures = result.gestures()
                   val handedness = result.handedness()
                   val hands = landmarks.mapIndexed { index, rawPoints ->
-                      val topGesture = gestures.getOrNull(index)?.firstOrNull()
                       val handLabel = handedness.getOrNull(index)?.firstOrNull()?.let(::categoryLabel)
                       DetectedHand(
                           points = rawPoints.map { landmark -> landmark.x() to landmark.y() },
-                          gesture = topGesture?.categoryName(),
-                          score = topGesture?.score() ?: 0f,
+                          gesture = null,
+                          score = 0f,
                           handedness = handLabel
                       )
                   }
                   if (hands.isEmpty()) return emptyList()
-                  // MediaPipe supplies handedness for normal selfie-camera input. The
-                  // fallback keeps one visible hand usable on devices that omit a label.
-                  if (hands.size == 1) return hands
+                  if (hands.size == 1) {
+                      val hand = hands.first()
+                      if (hand.isRight || hand.isLeft) return rememberHands(hands)
+                      val center = hand.palmCenter ?: return emptyList()
+                      val rightDistance = lastRightPalm?.let { palmDistance(center, it) }
+                      val leftDistance = lastLeftPalm?.let { palmDistance(center, it) }
+                      val side = when {
+                          rightDistance != null && (leftDistance == null || rightDistance < leftDistance) -> "Right"
+                          leftDistance != null -> "Left"
+                          center.first < .5f -> "Right"
+                          else -> "Left"
+                      }
+                      return rememberHands(listOf(hand.copy(handedness = side)))
+                  }
                   val hasRight = hands.any { it.isRight }
                   val hasLeft = hands.any { it.isLeft }
-                  if (hasRight && hasLeft) return hands
+                  if (hasRight && hasLeft) return rememberHands(hands)
           
-                  // If only one handedness label survived a frame, assign the unlabeled
-                  // hand to the missing side. This prevents a temporary classifier gap
-                  // from disabling either the right-hand scroll or left-fist trigger.
-                  if (hasRight) return emptyList()
-                  if (hasLeft) return emptyList()
-          
-                  // On devices that omit handedness altogether, the mirrored selfie
-                  // image places the user's right hand on the lower-x side in normal use.
-                  val ordered = hands.sortedBy { it.palmCenter?.first ?: .5f }
-                  return ordered.mapIndexed { index, hand ->
-                      hand.copy(handedness = if (index == 0) "Right" else "Left")
+                  if (hands.count { it.isRight } == 1 && !hasLeft) {
+                      return rememberHands(hands.map { if (it.isRight) it else it.copy(handedness = "Left") })
                   }
+                  if (hands.count { it.isLeft } == 1 && !hasRight) {
+                      return rememberHands(hands.map { if (it.isLeft) it else it.copy(handedness = "Right") })
+                  }
+          
+                  val first = hands[0]
+                  val second = hands[1]
+                  val firstCenter = first.palmCenter
+                  val secondCenter = second.palmCenter
+                  val resolved = if (firstCenter != null && secondCenter != null &&
+                      lastRightPalm != null && lastLeftPalm != null
+                  ) {
+                      val directCost = palmDistance(firstCenter, lastRightPalm!!) + palmDistance(secondCenter, lastLeftPalm!!)
+                      val crossedCost = palmDistance(firstCenter, lastLeftPalm!!) + palmDistance(secondCenter, lastRightPalm!!)
+                      if (directCost <= crossedCost) {
+                          listOf(first.copy(handedness = "Right"), second.copy(handedness = "Left"))
+                      } else {
+                          listOf(first.copy(handedness = "Left"), second.copy(handedness = "Right"))
+                      }
+                  } else {
+                      hands.sortedBy { it.palmCenter?.first ?: .5f }.mapIndexed { index, hand ->
+                          hand.copy(handedness = if (index == 0) "Right" else "Left")
+                      }
+                  }
+                  return rememberHands(resolved)
+              }
+          
+              private fun rememberHands(hands: List<DetectedHand>): List<DetectedHand> {
+                  hands.firstOrNull { it.isRight }?.palmCenter?.let { lastRightPalm = it }
+                  hands.firstOrNull { it.isLeft }?.palmCenter?.let { lastLeftPalm = it }
+                  val resolved = if (getSharedPreferences("settings", MODE_PRIVATE)
+                          .getBoolean("swapHands", false)
+                  ) {
+                      hands.map { hand ->
+                          when {
+                              hand.isRight -> hand.copy(handedness = "Left")
+                              hand.isLeft -> hand.copy(handedness = "Right")
+                              else -> hand
+                          }
+                      }
+                  } else hands
+                  return resolved
+              }
+          
+              private fun palmDistance(a: Pair<Float, Float>, b: Pair<Float, Float>): Float {
+                  return kotlin.math.hypot(
+                      (a.first - b.first).toDouble(),
+                      (a.second - b.second).toDouble()
+                  ).toFloat()
               }
           
               private fun categoryLabel(category: Category): String? {
                   val label = category.categoryName().ifBlank { category.displayName() }
-                  return label.trim().lowercase(Locale.US).replace('-', '_').let {
-                      when {
-                          // Recognition runs after the selfie frame is mirrored.
-                          it == "right" || it == "right_hand" -> "Left"
-                          it == "left" || it == "left_hand" -> "Right"
-                          else -> label
-                      }
-                  }
+                  return normalizeMirroredHandedness(label)
               }
           
               private fun fail(message: String) {
@@ -857,8 +912,8 @@ jobs:
                   provider = null
                   rightInputEngine.reset()?.let { GestureAccessibilityService.instance?.endDrag() }
                   HandOverlayManager.remove()
-                  // Close the recognizer on the same serial worker that processes frames.
-                  worker.execute { runCatching { recognizer?.close() }; recognizer = null }
+                  // Close the landmarker on the same serial worker that processes frames.
+                  worker.execute { runCatching { landmarker?.close() }; landmarker = null }
                   worker.shutdown()
                   stopForeground(STOP_FOREGROUND_REMOVE)
                   super.onDestroy()
@@ -989,21 +1044,23 @@ jobs:
           class HandOverlayView(context: Context) : View(context) {
               private data class DigitalPaints(
                   val glow: Paint,
-                  val dots: Paint,
+                  val denseDots: Paint,
+                  val sparseDots: Paint,
                   val edge: Paint
               )
+              private data class ShapePoint(val x: Float, val y: Float)
               private data class TrailPoint(val point: Pair<Float, Float>, val at: Long)
           
               private var hands: List<DetectedHand> = emptyList()
               private var fadingHands: List<DetectedHand> = emptyList()
               private var fadeStartedAt = 0L
               private val handPath = Path()
-              private val segmentPath = Path()
+              private val partPath = Path()
               // Bright enough to remain readable at rest, while preserving the
               // dark-red digital identity. Active input shifts to vivid signal red.
-              private val leftDigital = createDigitalPaints(Color.rgb(204, 28, 52), 78, 212, 224)
-              private val rightDigital = createDigitalPaints(Color.rgb(190, 22, 45), 72, 202, 214)
-              private val activeDigital = createDigitalPaints(Color.rgb(255, 55, 76), 96, 238, 250)
+              private val leftDigital = createDigitalPaints(Color.rgb(210, 25, 52), 72, 205, 82, 205)
+              private val rightDigital = createDigitalPaints(Color.rgb(188, 18, 43), 68, 194, 74, 194)
+              private val activeDigital = createDigitalPaints(Color.rgb(255, 48, 68), 92, 232, 108, 238)
               private var volumeLevel = 0
               private var volumeMaximum = 1
               private var volumeUntil = 0L
@@ -1100,52 +1157,123 @@ jobs:
                       hand.isLeft -> leftDigital
                       else -> rightDigital
                   }
-                  fun x(i: Int) = p[i].first * width
-                  fun y(i: Int) = p[i].second * height
-                  handPath.apply {
-                      rewind()
-                      fillType = Path.FillType.WINDING
-                      moveTo(x(0), y(0))
-                      for (i in intArrayOf(1, 2, 5, 9, 13, 17)) lineTo(x(i), y(i))
-                      close()
-                  }
-                  // Tapered capsules keep the silhouette elegant and readable without
-                  // allocating meshes or running blur effects on every camera frame.
-                  val base = hypot(x(5) - x(17), y(5) - y(17)).coerceAtLeast(12f) * .108f
+                  fun point(i: Int) = ShapePoint(p[i].first * width, p[i].second * height)
+                  val palmWidth = distance(point(5), point(17)).coerceAtLeast(12f)
+          
+                  // The landmarks are only a hidden armature. A smooth palm mass and five
+                  // tapered ribbons are unioned into one outline, so no joint circle or
+                  // internal bone line remains visible.
+                  smoothClosedBlob(
+                      partPath,
+                      intArrayOf(0, 1, 2, 5, 9, 13, 17).map(::point)
+                  )
+                  handPath.rewind()
+                  handPath.set(partPath)
                   val chains = arrayOf(
                       intArrayOf(1, 2, 3, 4), intArrayOf(5, 6, 7, 8), intArrayOf(9, 10, 11, 12),
                       intArrayOf(13, 14, 15, 16), intArrayOf(17, 18, 19, 20)
                   )
-                  for (chain in chains) {
-                      for (j in 0..2) {
-                          val a = chain[j]
-                          val b = chain[j + 1]
-                          val ra = base * (1f - j * .15f)
-                          val rb = base * (.85f - j * .15f)
-                          val dx = x(b) - x(a)
-                          val dy = y(b) - y(a)
-                          val len = hypot(dx, dy).coerceAtLeast(1f)
-                          val nx = -dy / len
-                          val ny = dx / len
-                          segmentPath.apply {
-                              rewind()
-                              moveTo(x(a) + nx * ra, y(a) + ny * ra)
-                              lineTo(x(b) + nx * rb, y(b) + ny * rb)
-                              lineTo(x(b) - nx * rb, y(b) - ny * rb)
-                              lineTo(x(a) - nx * ra, y(a) - ny * ra)
-                              close()
-                          }
-                          handPath.addPath(segmentPath)
-                          handPath.addCircle(x(a), y(a), ra, Path.Direction.CW)
-                          handPath.addCircle(x(b), y(b), rb, Path.Direction.CW)
-                      }
+                  for ((finger, chain) in chains.withIndex()) {
+                      val scale = if (finger == 0) 1.05f else 1f
+                      smoothFingerRibbon(
+                          partPath,
+                          chain.map(::point),
+                          floatArrayOf(.135f, .118f, .096f, .068f).map { it * palmWidth * scale }
+                      )
+                      if (!handPath.op(partPath, Path.Op.UNION)) handPath.addPath(partPath)
                   }
-                  val save = canvas.saveLayerAlpha(0f, 0f, width.toFloat(), height.toFloat(), (alpha * 255f).toInt().coerceIn(0, 255))
+                  // Scale the four paint alphas directly. A full-screen saveLayer would
+                  // allocate a large off-screen buffer on every frame and cause jank.
+                  val glowAlpha = paints.glow.alpha
+                  val denseAlpha = paints.denseDots.alpha
+                  val sparseAlpha = paints.sparseDots.alpha
+                  val edgeAlpha = paints.edge.alpha
+                  paints.glow.alpha = (glowAlpha * alpha).toInt().coerceIn(0, 255)
+                  paints.denseDots.alpha = (denseAlpha * alpha).toInt().coerceIn(0, 255)
+                  paints.sparseDots.alpha = (sparseAlpha * alpha).toInt().coerceIn(0, 255)
+                  paints.edge.alpha = (edgeAlpha * alpha).toInt().coerceIn(0, 255)
                   canvas.drawPath(handPath, paints.glow)
-                  canvas.drawPath(handPath, paints.dots)
+                  canvas.drawPath(handPath, paints.denseDots)
+                  canvas.drawPath(handPath, paints.sparseDots)
                   canvas.drawPath(handPath, paints.edge)
-                  canvas.restoreToCount(save)
+                  paints.glow.alpha = glowAlpha
+                  paints.denseDots.alpha = denseAlpha
+                  paints.sparseDots.alpha = sparseAlpha
+                  paints.edge.alpha = edgeAlpha
               }
+          
+              private fun smoothClosedBlob(path: Path, points: List<ShapePoint>) {
+                  path.rewind()
+                  if (points.size < 3) return
+                  val first = midpoint(points.last(), points.first())
+                  path.moveTo(first.x, first.y)
+                  for (index in points.indices) {
+                      val current = points[index]
+                      val next = points[(index + 1) % points.size]
+                      val end = midpoint(current, next)
+                      path.quadTo(current.x, current.y, end.x, end.y)
+                  }
+                  path.close()
+              }
+          
+              private fun smoothFingerRibbon(path: Path, points: List<ShapePoint>, widths: List<Float>) {
+                  path.rewind()
+                  if (points.size < 2 || points.size != widths.size) return
+                  val left = ArrayList<ShapePoint>(points.size)
+                  val right = ArrayList<ShapePoint>(points.size)
+                  for (index in points.indices) {
+                      val before = points[if (index == 0) 0 else index - 1]
+                      val after = points[if (index == points.lastIndex) points.lastIndex else index + 1]
+                      val dx = after.x - before.x
+                      val dy = after.y - before.y
+                      val length = hypot(dx, dy).coerceAtLeast(1f)
+                      val nx = -dy / length
+                      val ny = dx / length
+                      left += ShapePoint(points[index].x + nx * widths[index], points[index].y + ny * widths[index])
+                      right += ShapePoint(points[index].x - nx * widths[index], points[index].y - ny * widths[index])
+                  }
+                  path.moveTo(left[0].x, left[0].y)
+                  appendSmoothSide(path, left)
+                  val tip = points.last()
+                  val tipTangent = unitVector(points[points.lastIndex - 1], tip)
+                  path.quadTo(
+                      tip.x + tipTangent.x * widths.last(),
+                      tip.y + tipTangent.y * widths.last(),
+                      right.last().x,
+                      right.last().y
+                  )
+                  appendSmoothSide(path, right.asReversed())
+                  val base = points.first()
+                  val baseTangent = unitVector(points[1], base)
+                  path.quadTo(
+                      base.x + baseTangent.x * widths.first(),
+                      base.y + baseTangent.y * widths.first(),
+                      left[0].x,
+                      left[0].y
+                  )
+                  path.close()
+              }
+          
+              private fun appendSmoothSide(path: Path, points: List<ShapePoint>) {
+                  if (points.size < 2) return
+                  for (index in 1 until points.lastIndex) {
+                      val end = midpoint(points[index], points[index + 1])
+                      path.quadTo(points[index].x, points[index].y, end.x, end.y)
+                  }
+                  path.lineTo(points.last().x, points.last().y)
+              }
+          
+              private fun midpoint(a: ShapePoint, b: ShapePoint) =
+                  ShapePoint((a.x + b.x) * .5f, (a.y + b.y) * .5f)
+          
+              private fun unitVector(from: ShapePoint, to: ShapePoint): ShapePoint {
+                  val dx = to.x - from.x
+                  val dy = to.y - from.y
+                  val length = hypot(dx, dy).coerceAtLeast(1f)
+                  return ShapePoint(dx / length, dy / length)
+              }
+          
+              private fun distance(a: ShapePoint, b: ShapePoint): Float = hypot(a.x - b.x, a.y - b.y)
           
               private fun drawCursor(canvas: Canvas, now: Long) {
                   cleanupTrail(now)
@@ -1176,32 +1304,46 @@ jobs:
               private fun createDigitalPaints(
                   color: Int,
                   glowAlpha: Int,
-                  dotAlpha: Int,
+                  denseAlpha: Int,
+                  sparseAlpha: Int,
                   edgeAlpha: Int
               ): DigitalPaints {
                   val density = resources.displayMetrics.density
-                  val cell = (4.5f * density).toInt().coerceAtLeast(4)
-                  val tile = Bitmap.createBitmap(cell, cell, Bitmap.Config.ARGB_8888)
-                  Canvas(tile).drawCircle(
-                      cell * .5f, cell * .5f, (cell * .18f).coerceAtLeast(1f),
+                  val denseCell = (4.2f * density).toInt().coerceAtLeast(4)
+                  val denseTile = Bitmap.createBitmap(denseCell, denseCell, Bitmap.Config.ARGB_8888)
+                  Canvas(denseTile).drawCircle(
+                      denseCell * .5f, denseCell * .5f, (denseCell * .17f).coerceAtLeast(1f),
                       Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color }
                   )
+                  val sparseCell = (13f * density).toInt().coerceAtLeast(10)
+                  val sparseTile = Bitmap.createBitmap(sparseCell, sparseCell, Bitmap.Config.ARGB_8888)
+                  val spark = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = Color.rgb(255, 92, 110) }
+                  Canvas(sparseTile).apply {
+                      drawCircle(sparseCell * .18f, sparseCell * .27f, (1.05f * density).coerceAtLeast(1f), spark)
+                      drawCircle(sparseCell * .70f, sparseCell * .58f, (.72f * density).coerceAtLeast(1f), spark)
+                      drawCircle(sparseCell * .42f, sparseCell * .86f, (.52f * density).coerceAtLeast(1f), spark)
+                  }
                   return DigitalPaints(
                       glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                           this.color = color
                           alpha = glowAlpha
                           style = Paint.Style.FILL
                       },
-                      dots = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                          shader = BitmapShader(tile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
-                          alpha = dotAlpha
+                      denseDots = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                          shader = BitmapShader(denseTile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+                          alpha = denseAlpha
+                          style = Paint.Style.FILL
+                      },
+                      sparseDots = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                          shader = BitmapShader(sparseTile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+                          alpha = sparseAlpha
                           style = Paint.Style.FILL
                       },
                       edge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                           this.color = color
                           alpha = edgeAlpha
                           style = Paint.Style.STROKE
-                          strokeWidth = 1.15f * density
+                          strokeWidth = 1.05f * density
                           strokeJoin = Paint.Join.ROUND
                           strokeCap = Paint.Cap.ROUND
                       }
@@ -1251,6 +1393,16 @@ jobs:
           package com.sc.millegesture
           
           import kotlin.math.hypot
+          import java.util.Locale
+          
+          /** MediaPipe labels already match the user when the supplied selfie frame is mirrored. */
+          internal fun normalizeMirroredHandedness(label: String): String? {
+              return when (label.trim().lowercase(Locale.US).replace('-', '_')) {
+                  "right", "right_hand" -> "Right"
+                  "left", "left_hand" -> "Left"
+                  else -> label.takeIf { it.isNotBlank() }
+              }
+          }
           
           /** A single MediaPipe hand in display-oriented normalized coordinates. */
           data class DetectedHand(
@@ -1296,28 +1448,32 @@ jobs:
           
               val indexTip: Pair<Float, Float>?
                   get() = points.getOrNull(8)
-
+          
               /** Stable pointer coordinate halfway between the thumb and index tips. */
               val thumbIndexCenter: Pair<Float, Float>?
                   get() {
                       if (points.size <= 8) return null
                       return (points[4].first + points[8].first) / 2f to
                           (points[4].second + points[8].second) / 2f
-                  }
+                            }
+          
+              val thumbIndexRatio: Float?
+                  get() = if (points.size == 21) distance(points[4], points[8]) / palmScale else null
+          
+              val thumbMiddleRatio: Float?
+                  get() = if (points.size == 21) distance(points[4], points[12]) / palmScale else null
           
               /** Thumb and index fingertips touching, normalized by the visible palm size. */
               val thumbIndexPinch: Boolean
                   get() {
-                      if (points.size != 21) return false
-                      return distance(points[4], points[8]) <= palmScale * .34f
+                      return (thumbIndexRatio ?: Float.MAX_VALUE) <= .34f
                   }
           
               /** Volume pose: thumb and middle touch while the index stays clearly away. */
               val thumbMiddlePinch: Boolean
                   get() {
-                      if (points.size != 21) return false
-                      return distance(points[4], points[12]) <= palmScale * .34f &&
-                          distance(points[4], points[8]) >= palmScale * .46f
+                      return (thumbMiddleRatio ?: Float.MAX_VALUE) <= .34f &&
+                          (thumbIndexRatio ?: 0f) >= .46f
                   }
           
               val thumbMiddleCenter: Pair<Float, Float>?
@@ -1458,7 +1614,9 @@ jobs:
                           setOnCheckedChangeListener { _, checked -> prefs.edit().putBoolean(key, checked).apply() }
                       })
                   }
-                  toggle("reverseY", "상하 방향 반전")
+                  toggle("swapHands", "왼손·오른손 인식 바꾸기")
+                  toggle("reverseX", "좌우 스크롤 방향 반전")
+                  toggle("reverseY", "상하 스크롤 방향 반전")
                   toggle("shadow", "손 그림자 표시", true)
                   fun slider(key: String, title: String, default: Int) {
                       val text = label("$title: ${prefs.getInt(key, default)}")
@@ -1479,8 +1637,8 @@ jobs:
                   slider("distance", "스크롤 거리", 50)
                   label(
                       """
-                      화면 잠금 시 손 인식 카메라는 중지되고, 박수 대기는 유지됩니다.
-                      손 그림자는 평소에도 더 밝게 보이고, 입력 순간에는 더 밝은 붉은색과 짧은 조준 링·흔적으로 표시됩니다.
+                      화면 잠금 시 카메라와 마이크 입력은 모두 쉬고, 잠금을 풀면 박수 대기가 자동으로 돌아옵니다.
+                      손 그림자는 관절점 없는 검붉은 디지털 덩어리로 표시되고, 입력 순간에는 선명한 붉은색과 짧은 조준 링·흔적으로 바뀝니다.
                       영상과 소리는 기기에서만 처리하며 저장·전송하지 않습니다.
                       """.trimIndent()
                   )
@@ -1726,6 +1884,79 @@ jobs:
               data class DragMove(val point: Pair<Float, Float>) : RightHandAction()
               data object DragEnd : RightHandAction()
               data class Volume(val steps: Int) : RightHandAction()
+          }
+          
+          data class StablePinchPose(val index: Boolean, val middle: Boolean)
+          
+          /**
+           * Adds hysteresis and short time confirmation to the raw fingertip distances.
+           * A one-frame landmark wobble therefore cannot release a click, end a drag, or
+           * turn the pointer pose into the volume pose.
+           */
+          class RightPinchPoseStabilizer {
+              private enum class Pose { NONE, INDEX, MIDDLE }
+          
+              private var stable = Pose.NONE
+              private var candidate = Pose.NONE
+              private var candidateSince = 0L
+              private var missingSince: Long? = null
+          
+              fun reset() {
+                  stable = Pose.NONE
+                  candidate = Pose.NONE
+                  candidateSince = 0L
+                  missingSince = null
+              }
+          
+              fun sample(now: Long, indexRatio: Float?, middleRatio: Float?): StablePinchPose {
+                  if (indexRatio == null || middleRatio == null) {
+                      val since = missingSince ?: now.also { missingSince = it }
+                      if (now - since >= 180L) commit(Pose.NONE, now)
+                      return result()
+                  }
+                  missingSince = null
+          
+                  val proposed = when (stable) {
+                      Pose.INDEX -> if (indexRatio <= .43f && (indexRatio + .055f < middleRatio || middleRatio > .35f)) {
+                          Pose.INDEX
+                      } else rawPose(indexRatio, middleRatio)
+                      Pose.MIDDLE -> if (middleRatio <= .43f && indexRatio >= .43f) {
+                          Pose.MIDDLE
+                      } else rawPose(indexRatio, middleRatio)
+                      Pose.NONE -> rawPose(indexRatio, middleRatio)
+                  }
+          
+                  if (proposed == stable) {
+                      candidate = stable
+                      candidateSince = now
+                      return result()
+                  }
+                  if (proposed != candidate) {
+                      candidate = proposed
+                      candidateSince = now
+                      return result()
+                  }
+                  val confirmation = if (proposed == Pose.NONE) 90L else 55L
+                  if (now - candidateSince >= confirmation) commit(proposed, now)
+                  return result()
+              }
+          
+              private fun rawPose(indexRatio: Float, middleRatio: Float): Pose = when {
+                  indexRatio <= .31f && indexRatio + .045f < middleRatio -> Pose.INDEX
+                  middleRatio <= .31f && indexRatio >= .49f -> Pose.MIDDLE
+                  else -> Pose.NONE
+              }
+          
+              private fun commit(next: Pose, now: Long) {
+                  stable = next
+                  candidate = next
+                  candidateSince = now
+              }
+          
+              private fun result() = StablePinchPose(
+                  index = stable == Pose.INDEX,
+                  middle = stable == Pose.MIDDLE
+              )
           }
           
           /**
@@ -2121,7 +2352,10 @@ jobs:
           import android.app.NotificationManager
           import android.app.PendingIntent
           import android.app.Service
+          import android.content.BroadcastReceiver
+          import android.content.Context
           import android.content.Intent
+          import android.content.IntentFilter
           import android.content.pm.PackageManager
           import android.media.AudioFormat
           import android.media.AudioManager
@@ -2147,11 +2381,27 @@ jobs:
           
               private val main = Handler(Looper.getMainLooper())
               @Volatile private var alive = false
+              @Volatile private var audioGeneration = 0
+              @Volatile private var activeRecord: AudioRecord? = null
               private var worker: Thread? = null
               private var firstClapAt = 0L
               private var lastSpikeAt = 0L
               private var lastToggleAt = 0L
               private var noiseFloor = 700f
+          
+              private val screenState = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      when (intent?.action) {
+                          Intent.ACTION_SCREEN_OFF -> pauseForLock()
+                          Intent.ACTION_USER_PRESENT -> resumeAfterUnlock()
+                          Intent.ACTION_SCREEN_ON -> {
+                              if (!getSystemService(KeyguardManager::class.java).isKeyguardLocked) {
+                                  resumeAfterUnlock()
+                              }
+                          }
+                      }
+                  }
+              }
           
               override fun onBind(intent: Intent?): IBinder? = null
           
@@ -2159,6 +2409,16 @@ jobs:
                   super.onCreate()
                   getSystemService(NotificationManager::class.java).createNotificationChannel(
                       NotificationChannel(CHANNEL_ID, "박수 대기", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  ContextCompat.registerReceiver(
+                      this,
+                      screenState,
+                      IntentFilter().apply {
+                          addAction(Intent.ACTION_SCREEN_OFF)
+                          addAction(Intent.ACTION_SCREEN_ON)
+                          addAction(Intent.ACTION_USER_PRESENT)
+                      },
+                      ContextCompat.RECEIVER_NOT_EXPORTED
                   )
               }
           
@@ -2181,18 +2441,15 @@ jobs:
                       stopSelf()
                       return START_NOT_STICKY
                   }
-                  if (alive) return START_STICKY
-                  alive = true
-                  RuntimeState.clapWaiting = true
-                  if (!RuntimeState.running) RuntimeState.message = "박수 대기 중 · 짧게 두 번 박수"
-                  worker = Thread(::recordLoop, "clap-monitor").also { it.start() }
+                  if (!alive) alive = true
+                  resumeAfterUnlock()
                   return START_STICKY
               }
           
               override fun onDestroy() {
                   alive = false
-                  worker?.interrupt()
-                  worker = null
+                  stopAudioMonitor()
+                  runCatching { unregisterReceiver(screenState) }
                   RuntimeState.clapWaiting = false
                   if (!RuntimeState.running && RuntimeState.message.startsWith("박수 대기")) {
                       RuntimeState.message = "중지됨"
@@ -2202,7 +2459,41 @@ jobs:
               }
           
               @SuppressLint("MissingPermission")
-              private fun recordLoop() {
+              private fun resumeAfterUnlock() {
+                  if (!alive) return
+                  val power = getSystemService(PowerManager::class.java)
+                  val keyguard = getSystemService(KeyguardManager::class.java)
+                  if (!power.isInteractive || keyguard.isKeyguardLocked) {
+                      pauseForLock()
+                      return
+                  }
+                  if (worker?.isAlive == true) return
+                  val generation = audioGeneration + 1
+                  audioGeneration = generation
+                  RuntimeState.clapWaiting = true
+                  if (!RuntimeState.running) RuntimeState.message = "박수 대기 중 · 짧게 두 번 박수"
+                  worker = Thread({ recordLoop(generation) }, "clap-monitor").also { it.start() }
+                  updateNotification()
+              }
+          
+              private fun pauseForLock() {
+                  stopAudioMonitor()
+                  RuntimeState.clapWaiting = false
+                  RuntimeState.message = "화면 잠금 · 카메라와 마이크 입력 중지"
+                  updateNotification()
+              }
+          
+              private fun stopAudioMonitor() {
+                  audioGeneration += 1
+                  runCatching { activeRecord?.stop() }
+                  activeRecord = null
+                  worker?.interrupt()
+                  worker = null
+                  firstClapAt = 0L
+                  lastSpikeAt = 0L
+              }
+          
+              private fun recordLoop(generation: Int) {
                   val sampleRate = 16000
                   val minSize = AudioRecord.getMinBufferSize(
                       sampleRate,
@@ -2229,8 +2520,10 @@ jobs:
                   }
                   val buffer = ShortArray(minSize / 2)
                   try {
+                      if (!alive || generation != audioGeneration) return
+                      activeRecord = record
                       record.startRecording()
-                      while (alive && !Thread.currentThread().isInterrupted) {
+                      while (alive && generation == audioGeneration && !Thread.currentThread().isInterrupted) {
                           val read = record.read(buffer, 0, buffer.size)
                           if (read <= 0) continue
                           val now = SystemClock.uptimeMillis()
@@ -2242,6 +2535,7 @@ jobs:
                   } finally {
                       runCatching { record.stop() }
                       record.release()
+                      if (activeRecord === record) activeRecord = null
                   }
               }
           
@@ -2321,11 +2615,18 @@ jobs:
                   return NotificationCompat.Builder(this, CHANNEL_ID)
                       .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                       .setContentTitle("SC Hand Gesture")
-                      .setContentText("박수 대기 · 짧게 두 번 박수로 카메라 전환")
+                      .setContentText(
+                          if (RuntimeState.clapWaiting) "박수 대기 · 짧게 두 번 박수로 카메라 전환"
+                          else "화면 잠금 · 마이크 입력 중지"
+                      )
                       .setContentIntent(content)
                       .setOngoing(true)
                       .addAction(0, "중지", stop)
                       .build()
+              }
+          
+              private fun updateNotification() {
+                  getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
               }
           }
           SC_FILE_EOF
@@ -2448,11 +2749,40 @@ jobs:
           package com.sc.millegesture
           
           import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertFalse
           import org.junit.Assert.assertNull
           import org.junit.Assert.assertTrue
           import org.junit.Test
           
           class TwoHandGestureTest {
+              @Test fun mirroredSelfieHandednessStaysUserRelative() {
+                  assertEquals("Left", normalizeMirroredHandedness("Left"))
+                  assertEquals("Right", normalizeMirroredHandedness("right_hand"))
+              }
+          
+              @Test fun pointerPinchRequiresStableClosure() {
+                  val filter = RightPinchPoseStabilizer()
+                  assertFalse(filter.sample(0L, .60f, .70f).index)
+                  assertFalse(filter.sample(20L, .25f, .58f).index)
+                  assertTrue(filter.sample(80L, .25f, .58f).index)
+              }
+          
+              @Test fun oneFramePinchGapDoesNotReleasePointer() {
+                  val filter = RightPinchPoseStabilizer()
+                  filter.sample(0L, .25f, .58f)
+                  assertTrue(filter.sample(60L, .25f, .58f).index)
+                  assertTrue(filter.sample(100L, .49f, .58f).index)
+                  assertTrue(filter.sample(135L, .26f, .58f).index)
+              }
+          
+              @Test fun volumePinchMustKeepIndexAway() {
+                  val filter = RightPinchPoseStabilizer()
+                  filter.sample(0L, .58f, .24f)
+                  val volume = filter.sample(60L, .58f, .24f)
+                  assertTrue(volume.middle)
+                  assertFalse(volume.index)
+              }
+          
               @Test fun slowMovementRemainsUsable() {
                   val engine = TwoFingerGestureEngine()
                   engine.sample(0L, .5f to .5f, true)
@@ -2638,7 +2968,7 @@ jobs:
           include(":app")
           SC_FILE_EOF
           mkdir -p generated-android/app/src/main/assets
-          curl -fL --retry 3 "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task" -o generated-android/app/src/main/assets/gesture_recognizer.task
+          curl -fL --retry 3 "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" -o generated-android/app/src/main/assets/hand_landmarker.task
 
       - name: Tests, APK and lint
         working-directory: generated-android
